@@ -334,9 +334,12 @@ class EcovacsDevice {
     }
 
     this.matterIdToEcovacsId.clear();
-    const areas = entries.map(([ecoId, name], i) => {
-      this.matterIdToEcovacsId.set(i + 1, ecoId);
-      return { areaId: i + 1, mapId: null, areaInfo: { locationInfo: { locationName: name, floorNumber: 0, areaType: null }, landmarkInfo: null } };
+    const areas = entries.map(([ecoId, name]) => {
+      // Use Ecovacs numeric ID as Matter areaId for stability across restarts
+      // This ensures Apple Home scenes always point to the correct room
+      const matterAreaId = (parseInt(ecoId, 10) || 0) + 1; // +1 to avoid 0
+      this.matterIdToEcovacsId.set(matterAreaId, ecoId);
+      return { areaId: matterAreaId, mapId: null, areaInfo: { locationInfo: { locationName: name, floorNumber: 0, areaType: null }, landmarkInfo: null } };
     });
 
     this.log.info(`[${this.name}] ServiceArea: ${areas.length} rooms`);
