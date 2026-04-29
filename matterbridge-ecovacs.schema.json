@@ -1,0 +1,98 @@
+{
+  "title": "Matterbridge Ecovacs Plugin",
+  "description": "Bridges Ecovacs Deebot robot vacuums into Apple Home via Matter",
+  "type": "object",
+  "required": [
+    "name",
+    "email",
+    "password",
+    "countryCode"
+  ],
+  "properties": {
+    "name": {
+      "title": "Name",
+      "type": "string",
+      "default": "Ecovacs"
+    },
+    "email": {
+      "title": "Ecovacs Account Email",
+      "description": "The email address of your Ecovacs account",
+      "type": "string",
+      "format": "email"
+    },
+    "password": {
+      "title": "Ecovacs Account Password",
+      "description": "Your Ecovacs account password",
+      "type": "string",
+      "format": "password"
+    },
+    "countryCode": {
+      "title": "Country Code",
+      "description": "Two-letter country code (e.g. IT, DE, US, UK)",
+      "type": "string",
+      "default": "IT",
+      "minLength": 2,
+      "maxLength": 2
+    },
+    "authDomain": {
+      "title": "Auth Domain (optional)",
+      "description": "Leave empty for default (ecovacs.com). Use yeedi.com for Yeedi devices.",
+      "type": "string",
+      "default": ""
+    },
+    "whiteList": {
+      "title": "Device Whitelist",
+      "description": "List of device nicknames to include. Leave empty to include all devices.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "pollingInterval": {
+      "title": "Polling Interval (seconds)",
+      "description": "How often to poll the device for status updates (0 = push only, 30-600 recommended)",
+      "type": "integer",
+      "default": 15,
+      "minimum": 0,
+      "maximum": 600
+    },
+    "debug": {
+      "title": "Debug Logging",
+      "description": "Enable verbose debug logging",
+      "type": "boolean",
+      "default": false
+    },
+    "rooms": {
+      "title": "Room Configuration",
+      "description": "Customize which rooms are visible in Apple Home and their display names. Rooms not listed here will be shown with their names from the Ecovacs app.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "title": "Room ID",
+            "description": "The Ecovacs internal room ID (shown in logs as 'Room loaded: ID = name')",
+            "type": "string"
+          },
+          "name": {
+            "title": "Custom Name",
+            "description": "Custom display name in Apple Home. Leave empty to use the Ecovacs name.",
+            "type": "string",
+            "default": ""
+          },
+          "enabled": {
+            "title": "Enabled",
+            "description": "Whether this room is visible in Apple Home",
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "default": []
+    }
+  }
+}

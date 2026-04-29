@@ -1,0 +1,62 @@
+{
+  "title": "Matterbridge Ecovacs Plugin",
+  "description": "Bridges Ecovacs Deebot robot vacuums into Apple Home via Matter",
+  "type": "object",
+  "required": ["name", "email", "password", "countryCode"],
+  "properties": {
+    "name": {
+      "title": "Name",
+      "type": "string",
+      "default": "Ecovacs"
+    },
+    "email": {
+      "title": "Ecovacs Account Email",
+      "description": "The email address of your Ecovacs account",
+      "type": "string",
+      "format": "email"
+    },
+    "password": {
+      "title": "Ecovacs Account Password",
+      "description": "Your Ecovacs account password",
+      "type": "string",
+      "format": "password"
+    },
+    "countryCode": {
+      "title": "Country Code",
+      "description": "Two-letter country code (e.g. IT, DE, US, UK)",
+      "type": "string",
+      "default": "IT",
+      "minLength": 2,
+      "maxLength": 2
+    },
+    "authDomain": {
+      "title": "Auth Domain (optional)",
+      "description": "Leave empty for default (ecovacs.com). Use yeedi.com for Yeedi devices.",
+      "type": "string",
+      "default": ""
+    },
+    "whiteList": {
+      "title": "Device Whitelist",
+      "description": "List of device nicknames to include. Leave empty to include all devices.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "pollingInterval": {
+      "title": "Polling Interval (seconds)",
+      "description": "How often to poll the device for status updates (0 = push only, 30-600 recommended)",
+      "type": "integer",
+      "default": 30,
+      "minimum": 0,
+      "maximum": 600
+    },
+    "debug": {
+      "title": "Debug Logging",
+      "description": "Enable verbose debug logging",
+      "type": "boolean",
+      "default": false
+    }
+  }
+}
