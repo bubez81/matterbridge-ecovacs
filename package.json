@@ -2,15 +2,7 @@
   "name": "matterbridge-ecovacs",
   "version": "0.1.55",
   "description": "Matterbridge plugin to bridge Ecovacs Deebot robot vacuums into Apple Home via Matter",
-  "author": "bubez81",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/bubez81/matterbridge-ecovacs.git"
-  },
-  "homepage": "https://github.com/bubez81/matterbridge-ecovacs#readme",
-  "bugs": {
-    "url": "https://github.com/bubez81/matterbridge-ecovacs/issues"
-  },
+  "author": "Michele Vitulli",
   "license": "Apache-2.0",
   "type": "module",
   "main": "dist/index.js",
@@ -22,13 +14,26 @@
     },
     "./package.json": "./package.json"
   },
-  "keywords": ["matterbridge", "matterbridge-plugin", "matter", "ecovacs", "deebot", "vacuum"],
-  "engines": { "node": ">=20.19.0" },
+  "keywords": [
+    "matterbridge",
+    "matterbridge-plugin",
+    "matter",
+    "ecovacs",
+    "deebot",
+    "vacuum"
+  ],
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "scripts": {
     "build": "tsc",
     "watch": "tsc --watch"
   },
-  "files": ["dist", "matterbridge-ecovacs.schema.json", "README.md"],
+  "files": [
+    "dist",
+    "matterbridge-ecovacs.schema.json",
+    "README.md"
+  ],
   "dependencies": {
     "ecovacs-deebot": "0.9.6-beta.12",
     "node-machine-id": "^1.1.12"
@@ -39,5 +44,13 @@
   },
   "matterbridge": {
     "type": "DynamicPlatform"
+  },
+  "homepage": "https://github.com/YOUR_USERNAME/matterbridge-ecovacs#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR_USERNAME/matterbridge-ecovacs.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YOUR_USERNAME/matterbridge-ecovacs/issues"
   }
 }
