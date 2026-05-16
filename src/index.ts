@@ -386,7 +386,11 @@ class EcovacsDevice {
       this.vacbot?.run('Resume'); this.cleanState = OpState.Running; this.applyState();
     });
     this.endpoint.addCommandHandler('RvcOperationalState.goHome', async () => {
-      this.vacbot?.run('Charge'); this.cleanState = OpState.SeekingCharger; this.applyState();
+      this.vacbot?.run('Stop');
+      await new Promise(r => setTimeout(r, 500));
+      this.vacbot?.run('Charge');
+      this.cleanState = OpState.SeekingCharger;
+      this.applyState();
     });
   }
 
