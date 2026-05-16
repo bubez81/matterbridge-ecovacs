@@ -34,7 +34,8 @@ function cleanReportToOpState(v: string): number {
       return OpState.Running;
     case 'pause':      return OpState.Paused;
     case 'returning':  case 'goCharging': return OpState.SeekingCharger;
-    case 'washing':    case 'drying': case 'airdrying': return OpState.CleaningMop;
+    case 'washing':              return OpState.CleaningMop;
+    case 'drying': case 'airdrying': return OpState.Docked;
     default:           return OpState.Stopped;
   }
 }
@@ -257,7 +258,7 @@ class EcovacsDevice {
     });
 
     this.vacbot.on('MopWash', (v: string) => {
-      if (v === 'washing' || v === 'start') { this.cleanState = OpState.CleaningMop; this.applyState(); }
+      if (v === 'washing') { this.cleanState = OpState.CleaningMop; this.applyState(); }
     });
 
     // CurrentStats fires during cleaning — use it as a Running indicator
