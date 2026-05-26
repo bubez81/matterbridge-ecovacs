@@ -155,6 +155,9 @@ class EcovacsDevice {
     this.vacbot.on('ready', () => {
       this.log.info(`[${this.name}] Connected — refreshing state in 3s`);
       this.reconnectAttempt = 0;
+      this.endpoint?.setAttribute('RvcOperationalState', 'operationalError',
+        { errorStateId: 0, errorStateLabel: undefined, errorStateDetails: undefined }, this.log)
+        .catch(() => undefined);
       setTimeout(() => {
         if (this.shuttingDown) return;
         this.vacbot?.run('GetBatteryState');
