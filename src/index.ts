@@ -102,6 +102,8 @@ class EcovacsDevice {
   private roomsLoaded = false;
   private roomsExpected = 0;
 
+  private currentErrorId: number = RvcOperationalState.ErrorState.NoError;
+
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private shuttingDown = false;
@@ -133,16 +135,18 @@ class EcovacsDevice {
       this.cleanState === OpState.EmptyingDustBin
     ) ? this.cleanState : this.chargeState;
 
+    // Always sync operationalError: use stored error code in Error state, NoError otherwise
+    const errId = resolved === OpState.Error
+      ? this.currentErrorId
+      : RvcOperationalState.ErrorState.NoError;
+    this.endpoint?.setAttribute('RvcOperationalState', 'operationalError',
+      { errorStateId: errId, errorStateLabel: undefined, errorStateDetails: undefined }, this.log).catch(() => undefined);
+
     if (resolved === this.opState) return;
     this.opState = resolved;
     const label = (RvcOperationalState.OperationalState as Record<number, string>)[resolved] ?? String(resolved);
     this.log.info(`[${this.name}] opState → ${label}`);
     this.endpoint?.setAttribute('RvcOperationalState', 'operationalState', resolved, this.log).catch(() => undefined);
-    const errId = resolved === OpState.Error
-      ? RvcOperationalState.ErrorState.UnableToCompleteOperation
-      : RvcOperationalState.ErrorState.NoError;
-    this.endpoint?.setAttribute('RvcOperationalState', 'operationalError',
-      { errorStateId: errId, errorStateLabel: undefined, errorStateDetails: undefined }, this.log).catch(() => undefined);
   }
 
   async connect(): Promise<void> {
@@ -246,18 +250,15 @@ class EcovacsDevice {
     this.vacbot.on('ErrorCode', (code: number) => {
       this.log.warn(`[${this.name}] ErrorCode: ${code}`);
       if (code === 0 || code === 100) {
-        // NoError — clear error state
-        this.endpoint?.setAttribute('RvcOperationalState', 'operationalError',
-          { errorStateId: RvcOperationalState.ErrorState.NoError, errorStateLabel: undefined, errorStateDetails: undefined },
-          this.log).catch(() => undefined);
+        // NoError — clear stored error and let applyState() propagate NoError
+        this.currentErrorId = RvcOperationalState.ErrorState.NoError;
+        this.applyState();
         return;
       }
       const errorStateId = ecovacsErrorToMatterError(code);
+      this.currentErrorId = errorStateId;
       this.cleanState = OpState.Error;
       this.applyState();
-      this.endpoint?.setAttribute('RvcOperationalState', 'operationalError',
-        { errorStateId, errorStateLabel: undefined, errorStateDetails: undefined },
-        this.log).catch(() => undefined);
     });
 
     this.vacbot.on('MopWash', (v: string) => {
