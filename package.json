@@ -1,6 +1,6 @@
 {
   "name": "matterbridge-ecovacs",
-  "version": "0.1.69",
+  "version": "0.1.70",
   "description": "Matterbridge plugin to bridge Ecovacs Deebot robot vacuums into Apple Home via Matter",
   "author": "Michele Galanti",
   "license": "Apache-2.0",

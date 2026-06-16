@@ -98,8 +98,11 @@ class EcovacsDevice {
   private matterIdToEcovacsId: Map<number, string> = new Map();
   private selectedAreaIds: string[] = [];
 
-  private lastBatPct: number = -1;
-  private lastBatChargeState: number = -1;
+  // Coalesces rapid setAttribute calls within a 50ms window (last value wins),
+  // then runs them sequentially to prevent concurrent Matter transactions that
+  // cause matterbridge to put the endpoint in "destroyed state".
+  private pendingAttrs: Map<string, { cluster: string; attr: string; value: any }> = new Map();
+  private pendingTimer: ReturnType<typeof setTimeout> | null = null;
 
   private rooms: Map<string, string> = new Map();
   private roomsLoaded = false;
@@ -129,6 +132,24 @@ class EcovacsDevice {
     this.registerHandlers();
   }
 
+  // Coalesce rapid setAttribute calls: within a 50ms window, last value wins.
+  // Then runs them one at a time (sequential await) to avoid concurrent transactions
+  // that cause matterbridge to put the endpoint in "destroyed state".
+  private scheduleAttr(cluster: string, attr: string, value: any): void {
+    const key = `${cluster}.${attr}`;
+    this.pendingAttrs.set(key, { cluster, attr, value });
+    if (!this.pendingTimer) {
+      this.pendingTimer = setTimeout(async () => {
+        this.pendingTimer = null;
+        const batch = [...this.pendingAttrs.values()];
+        this.pendingAttrs.clear();
+        for (const { cluster: c, attr: a, value: v } of batch) {
+          await this.endpoint?.setAttribute(c, a, v, this.log).catch(() => undefined);
+        }
+      }, 50);
+    }
+  }
+
   // State resolution: CleanReport wins for active states, ChargeState wins otherwise
   private applyState(): void {
     const resolved = (
@@ -142,14 +163,14 @@ class EcovacsDevice {
     const errId = resolved === OpState.Error
       ? this.currentErrorId
       : RvcOperationalState.ErrorState.NoError;
-    this.endpoint?.setAttribute('RvcOperationalState', 'operationalError',
-      { errorStateId: errId, errorStateLabel: undefined, errorStateDetails: undefined }, this.log).catch(() => undefined);
+    this.scheduleAttr('RvcOperationalState', 'operationalError',
+      { errorStateId: errId, errorStateLabel: undefined, errorStateDetails: undefined });
 
     if (resolved === this.opState) return;
     this.opState = resolved;
     const label = (RvcOperationalState.OperationalState as Record<number, string>)[resolved] ?? String(resolved);
     this.log.info(`[${this.name}] opState → ${label}`);
-    this.endpoint?.setAttribute('RvcOperationalState', 'operationalState', resolved, this.log).catch(() => undefined);
+    this.scheduleAttr('RvcOperationalState', 'operationalState', resolved);
   }
 
   async connect(): Promise<void> {
@@ -162,9 +183,8 @@ class EcovacsDevice {
     this.vacbot.on('ready', () => {
       this.log.info(`[${this.name}] Connected — refreshing state in 3s`);
       this.reconnectAttempt = 0;
-      this.endpoint?.setAttribute('RvcOperationalState', 'operationalError',
-        { errorStateId: 0, errorStateLabel: undefined, errorStateDetails: undefined }, this.log)
-        .catch(() => undefined);
+      this.scheduleAttr('RvcOperationalState', 'operationalError',
+        { errorStateId: 0, errorStateLabel: undefined, errorStateDetails: undefined });
       setTimeout(() => {
         if (this.shuttingDown) return;
         this.vacbot?.run('GetBatteryState');
@@ -238,19 +258,12 @@ class EcovacsDevice {
 
       this.applyState();
       const bat = s === OpState.Charging ? PowerSource.BatChargeState.IsCharging : PowerSource.BatChargeState.IsNotCharging;
-      if (bat !== this.lastBatChargeState) {
-        this.lastBatChargeState = bat;
-        this.endpoint?.setAttribute('PowerSource', 'batChargeState', bat, this.log).catch(() => undefined);
-      }
+      this.scheduleAttr('PowerSource', 'batChargeState', bat);
     });
 
     this.vacbot.on('BatteryInfo', (level: number) => {
       const pct = Math.max(0, Math.min(100, Math.round(level)));
-      const raw = pct * 2;
-      if (raw !== this.lastBatPct) {
-        this.lastBatPct = raw;
-        this.endpoint?.setAttribute('PowerSource', 'batPercentRemaining', raw, this.log).catch(() => undefined);
-      }
+      this.scheduleAttr('PowerSource', 'batPercentRemaining', pct * 2);
     });
 
     this.vacbot.on('Error', (description: string) => {
@@ -358,7 +371,7 @@ class EcovacsDevice {
     });
 
     this.log.info(`[${this.name}] ServiceArea: ${areas.length} rooms`);
-    this.endpoint.setAttribute('ServiceArea', 'supportedAreas', areas, this.log).catch(() => undefined);
+    this.scheduleAttr('ServiceArea', 'supportedAreas', areas);
   }
 
   private registerHandlers(): void {
@@ -377,7 +390,7 @@ class EcovacsDevice {
         .filter((id): id is string => id !== undefined);
       this.log.info(`[${this.name}] selectAreas: ${JSON.stringify(matterIds)} → ${JSON.stringify(this.selectedAreaIds)}`);
       setTimeout(() => {
-        this.endpoint?.setAttribute('ServiceArea', 'selectedAreas', matterIds, this.log).catch(() => undefined);
+        this.scheduleAttr('ServiceArea', 'selectedAreas', matterIds);
       }, 200);
     });
 
@@ -432,7 +445,7 @@ class EcovacsDevice {
   private setRunMode(m: number): void {
     if (this.runMode === m) return;
     this.runMode = m;
-    this.endpoint?.setAttribute('RvcRunMode', 'currentMode', m, this.log).catch(() => undefined);
+    this.scheduleAttr('RvcRunMode', 'currentMode', m);
   }
 
   private startPolling(): void {
