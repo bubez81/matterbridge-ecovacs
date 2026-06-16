@@ -328,10 +328,14 @@ class EcovacsDevice {
 
   private updateServiceAreas(): void {
     if (!this.endpoint || this.rooms.size === 0) return;
-    const firstDiscovery = !this.roomsLoaded;
+    const wasLoaded = this.roomsLoaded;
     if (this.roomsExpected === 0 || this.rooms.size >= this.roomsExpected) this.roomsLoaded = true;
 
-    if (firstDiscovery && this.roomsLoaded && this.roomsConfig.length === 0 && this.onRoomsDiscovered) {
+    // Wait until all rooms have arrived before pushing to Apple Home — avoids
+    // flooding the Matter fabric with incremental updates that show "Aggiornamento"
+    if (!this.roomsLoaded) return;
+
+    if (!wasLoaded && this.roomsConfig.length === 0 && this.onRoomsDiscovered) {
       const disc = Array.from(this.rooms.entries()).map(([id, name]) => ({ id, name, enabled: true }));
       this.onRoomsDiscovered(disc);
       this.onRoomsDiscovered = undefined;
