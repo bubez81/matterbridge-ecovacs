@@ -103,6 +103,7 @@ class EcovacsDevice {
   private roomsExpected = 0;
 
   private currentErrorId: number = RvcOperationalState.ErrorState.NoError;
+  private sentErrorId:   number = -1;
 
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -135,12 +136,15 @@ class EcovacsDevice {
       this.cleanState === OpState.EmptyingDustBin
     ) ? this.cleanState : this.chargeState;
 
-    // Always sync operationalError: use stored error code in Error state, NoError otherwise
+    // Sync operationalError only when the value actually changes
     const errId = resolved === OpState.Error
       ? this.currentErrorId
       : RvcOperationalState.ErrorState.NoError;
-    this.endpoint?.setAttribute('RvcOperationalState', 'operationalError',
-      { errorStateId: errId, errorStateLabel: undefined, errorStateDetails: undefined }, this.log).catch(() => undefined);
+    if (errId !== this.sentErrorId) {
+      this.sentErrorId = errId;
+      this.endpoint?.setAttribute('RvcOperationalState', 'operationalError',
+        { errorStateId: errId, errorStateLabel: undefined, errorStateDetails: undefined }, this.log).catch(() => undefined);
+    }
 
     if (resolved === this.opState) return;
     this.opState = resolved;
