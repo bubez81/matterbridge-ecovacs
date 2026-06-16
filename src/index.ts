@@ -124,6 +124,8 @@ class EcovacsDevice {
 
   bindEndpoint(ep: RoboticVacuumCleaner): void {
     this.endpoint = ep;
+    this.opState = -1;     // force full re-sync on next applyState()
+    this.sentErrorId = -1;
     this.registerHandlers();
   }
 
