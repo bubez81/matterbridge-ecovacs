@@ -97,6 +97,7 @@ class EcovacsDevice {
 
   private matterIdToEcovacsId: Map<number, string> = new Map();
   private selectedAreaIds: string[] = [];
+  private lastSentAreaKey: string = '';
 
   private rooms: Map<string, string> = new Map();
   private roomsLoaded = false;
@@ -126,7 +127,38 @@ class EcovacsDevice {
     this.endpoint = ep;
     this.opState = -1;     // force full re-sync on next applyState()
     this.sentErrorId = -1;
+
+    // Pre-populate the room map from saved config so that the first
+    // updateServiceAreas() call is a no-op (same key → no setAttribute)
+    if (this.roomsConfig.length > 0) {
+      this.matterIdToEcovacsId.clear();
+      const keyParts = this.roomsConfig
+        .filter(r => r.enabled !== false)
+        .map(r => {
+          const mid = (parseInt(r.id, 10) || 0) + 1;
+          this.matterIdToEcovacsId.set(mid, r.id);
+          return `${mid}:${(r.name ?? '').trim()}`;
+        });
+      this.lastSentAreaKey = keyParts.sort().join(',');
+    }
+
     this.registerHandlers();
+  }
+
+  // Set supportedAreas from saved config before the node goes live so Apple Home
+  // never sees a change (avoids "Aggiornamento" on every restart)
+  async preInitAreas(): Promise<void> {
+    if (!this.endpoint || this.roomsConfig.length === 0) return;
+    const entries = this.roomsConfig.filter(r => r.enabled !== false);
+    this.matterIdToEcovacsId.clear();
+    const areas = entries.map(r => {
+      const mid = (parseInt(r.id, 10) || 0) + 1;
+      this.matterIdToEcovacsId.set(mid, r.id);
+      return { areaId: mid, mapId: null, areaInfo: { locationInfo: { locationName: (r.name ?? '').trim(), floorNumber: 0, areaType: null }, landmarkInfo: null } };
+    });
+    const areaKey = areas.map(a => `${a.areaId}:${a.areaInfo.locationInfo.locationName}`).sort().join(',');
+    this.lastSentAreaKey = areaKey;
+    await this.endpoint.setAttribute('ServiceArea', 'supportedAreas', areas, this.log).catch(() => undefined);
   }
 
   // State resolution: CleanReport wins for active states, ChargeState wins otherwise
@@ -356,6 +388,11 @@ class EcovacsDevice {
       this.matterIdToEcovacsId.set(matterAreaId, ecoId);
       return { areaId: matterAreaId, mapId: null, areaInfo: { locationInfo: { locationName: name, floorNumber: 0, areaType: null }, landmarkInfo: null } };
     });
+
+    // Only push to fabric if areas actually changed
+    const areaKey = areas.map(a => `${a.areaId}:${a.areaInfo.locationInfo.locationName}`).sort().join(',');
+    if (areaKey === this.lastSentAreaKey) return;
+    this.lastSentAreaKey = areaKey;
 
     this.log.info(`[${this.name}] ServiceArea: ${areas.length} rooms`);
     this.endpoint.setAttribute('ServiceArea', 'supportedAreas', areas, this.log).catch(() => undefined);
@@ -605,6 +642,7 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
       };
     }
     device.bindEndpoint(endpoint);
+    await device.preInitAreas();
     this.devices.push(device);
     await this.registerDevice(endpoint as unknown as MatterbridgeEndpoint);
     device.connect().catch((err: unknown) => this.log.error(`[${name}] Initial connect failed: ${String(err)}`));
