@@ -92,17 +92,31 @@ class EcovacsDevice {
   private chargeState: number = OpState.Docked;
   private opState:     number = OpState.Docked;
 
+  // -1 = never sent; >0 = error active; 0 = NoError last sent after clearing error.
+  // We only write operationalError for real errors (errId > 0) and when clearing
+  // after a real error (sentErrorId > 0 → errId = 0). Never written for NoError
+  // at startup, so matter.js keeps its default and Apple Home stays happy.
+  private sentErrorId: number = -1;
+
   private runMode:   number = RUN.IDLE;
   private cleanMode: number = CLEAN.VACUUM;
 
   private matterIdToEcovacsId: Map<number, string> = new Map();
   private selectedAreaIds: string[] = [];
 
-  // Coalesces rapid setAttribute calls within a 50ms window (last value wins),
-  // then runs them sequentially to prevent concurrent Matter transactions that
-  // cause matterbridge to put the endpoint in "destroyed state".
-  private pendingAttrs: Map<string, { cluster: string; attr: string; value: any }> = new Map();
+  // Tracks last-sent value per attribute (JSON-serialized) to skip redundant
+  // setAttribute calls — matter.js 0.17.2 sends subscription notifications even
+  // for same-value writes, which makes Apple Home show "Aggiornamento".
+  private sentAttrs: Map<string, string> = new Map();
+
+  // Fast queue (50ms): all attributes except ServiceArea.
+  private pendingAttrs: Map<string, { cluster: string; attr: string; value: any; serialized: string }> = new Map();
   private pendingTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Slow queue (1000ms): ServiceArea only. Rooms arrive over ~800ms so we need
+  // a wider window to coalesce all 9 events into a single setAttribute call.
+  private pendingSlowAttrs: Map<string, { cluster: string; attr: string; value: any; serialized: string }> = new Map();
+  private pendingSlowTimer: ReturnType<typeof setTimeout> | null = null;
 
   private rooms: Map<string, string> = new Map();
   private roomsLoaded = false;
@@ -129,24 +143,46 @@ class EcovacsDevice {
 
   bindEndpoint(ep: RoboticVacuumCleaner): void {
     this.endpoint = ep;
+    this.sentAttrs.clear(); // force full re-sync: new endpoint starts with default values
+    this.opState = -1;      // force applyState to re-send operationalState
+    this.sentErrorId = -1;  // force re-send of active error (if any) to new endpoint
     this.registerHandlers();
   }
 
-  // Coalesce rapid setAttribute calls: within a 50ms window, last value wins.
-  // Then runs them one at a time (sequential await) to avoid concurrent transactions
-  // that cause matterbridge to put the endpoint in "destroyed state".
-  private scheduleAttr(cluster: string, attr: string, value: any): void {
+  // Coalesce rapid setAttribute calls. Skip if value unchanged (sentAttrs cache).
+  // slow=true uses a 1000ms window (ServiceArea rooms arrive over ~800ms).
+  // slow=false uses 50ms. Runs sequentially (await) to avoid concurrent transactions.
+  private scheduleAttr(cluster: string, attr: string, value: any, slow = false): void {
     const key = `${cluster}.${attr}`;
-    this.pendingAttrs.set(key, { cluster, attr, value });
-    if (!this.pendingTimer) {
-      this.pendingTimer = setTimeout(async () => {
-        this.pendingTimer = null;
-        const batch = [...this.pendingAttrs.values()];
-        this.pendingAttrs.clear();
-        for (const { cluster: c, attr: a, value: v } of batch) {
-          await this.endpoint?.setAttribute(c, a, v, this.log).catch(() => undefined);
-        }
-      }, 50);
+    const serialized = JSON.stringify(value);
+    if (this.sentAttrs.get(key) === serialized) return;
+
+    if (slow) {
+      this.pendingSlowAttrs.set(key, { cluster, attr, value, serialized });
+      if (!this.pendingSlowTimer) {
+        this.pendingSlowTimer = setTimeout(async () => {
+          this.pendingSlowTimer = null;
+          const batch = [...this.pendingSlowAttrs.values()];
+          this.pendingSlowAttrs.clear();
+          for (const { cluster: c, attr: a, value: v, serialized: s } of batch) {
+            await this.endpoint?.setAttribute(c, a, v, this.log).catch(() => undefined);
+            this.sentAttrs.set(`${c}.${a}`, s);
+          }
+        }, 1000);
+      }
+    } else {
+      this.pendingAttrs.set(key, { cluster, attr, value, serialized });
+      if (!this.pendingTimer) {
+        this.pendingTimer = setTimeout(async () => {
+          this.pendingTimer = null;
+          const batch = [...this.pendingAttrs.values()];
+          this.pendingAttrs.clear();
+          for (const { cluster: c, attr: a, value: v, serialized: s } of batch) {
+            await this.endpoint?.setAttribute(c, a, v, this.log).catch(() => undefined);
+            this.sentAttrs.set(`${c}.${a}`, s);
+          }
+        }, 50);
+      }
     }
   }
 
@@ -159,12 +195,29 @@ class EcovacsDevice {
       this.cleanState === OpState.EmptyingDustBin
     ) ? this.cleanState : this.chargeState;
 
-    // Always sync operationalError: use stored error code in Error state, NoError otherwise
+    // Write operationalError only when strictly necessary:
+    // - if there's a real error (errId > 0) and it changed: send it
+    // - if the error cleared (errId = 0) and we had previously sent one: send the clear
+    // - on startup with no error (errId = 0, sentErrorId = -1): do nothing
+    // This avoids matter.js 0.17.2 triggering Apple Home "Aggiornamento" by never
+    // writing the default NoError value (which matter.js normalizes differently
+    // than its own cluster default, causing a spurious subscription notification).
     const errId = resolved === OpState.Error
       ? this.currentErrorId
       : RvcOperationalState.ErrorState.NoError;
-    this.scheduleAttr('RvcOperationalState', 'operationalError',
-      { errorStateId: errId, errorStateLabel: undefined, errorStateDetails: undefined });
+    if (errId !== 0) {
+      if (errId !== this.sentErrorId) {
+        this.sentErrorId = errId;
+        this.scheduleAttr('RvcOperationalState', 'operationalError',
+          { errorStateId: errId, errorStateLabel: undefined, errorStateDetails: undefined });
+      }
+    } else if (this.sentErrorId > 0) {
+      // Had a real error, now clearing it
+      this.sentErrorId = 0;
+      this.scheduleAttr('RvcOperationalState', 'operationalError',
+        { errorStateId: 0, errorStateLabel: undefined, errorStateDetails: undefined });
+    }
+    // errId === 0 and sentErrorId <= 0: no-op — don't touch operationalError
 
     if (resolved === this.opState) return;
     this.opState = resolved;
@@ -183,8 +236,6 @@ class EcovacsDevice {
     this.vacbot.on('ready', () => {
       this.log.info(`[${this.name}] Connected — refreshing state in 3s`);
       this.reconnectAttempt = 0;
-      this.scheduleAttr('RvcOperationalState', 'operationalError',
-        { errorStateId: 0, errorStateLabel: undefined, errorStateDetails: undefined });
       setTimeout(() => {
         if (this.shuttingDown) return;
         this.vacbot?.run('GetBatteryState');
@@ -371,7 +422,7 @@ class EcovacsDevice {
     });
 
     this.log.info(`[${this.name}] ServiceArea: ${areas.length} rooms`);
-    this.scheduleAttr('ServiceArea', 'supportedAreas', areas);
+    this.scheduleAttr('ServiceArea', 'supportedAreas', areas, true);
   }
 
   private registerHandlers(): void {
