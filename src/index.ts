@@ -98,6 +98,9 @@ class EcovacsDevice {
   private matterIdToEcovacsId: Map<number, string> = new Map();
   private selectedAreaIds: string[] = [];
 
+  private lastBatPct: number = -1;
+  private lastBatChargeState: number = -1;
+
   private rooms: Map<string, string> = new Map();
   private roomsLoaded = false;
   private roomsExpected = 0;
@@ -235,12 +238,19 @@ class EcovacsDevice {
 
       this.applyState();
       const bat = s === OpState.Charging ? PowerSource.BatChargeState.IsCharging : PowerSource.BatChargeState.IsNotCharging;
-      this.endpoint?.setAttribute('PowerSource', 'batChargeState', bat, this.log).catch(() => undefined);
+      if (bat !== this.lastBatChargeState) {
+        this.lastBatChargeState = bat;
+        this.endpoint?.setAttribute('PowerSource', 'batChargeState', bat, this.log).catch(() => undefined);
+      }
     });
 
     this.vacbot.on('BatteryInfo', (level: number) => {
       const pct = Math.max(0, Math.min(100, Math.round(level)));
-      this.endpoint?.setAttribute('PowerSource', 'batPercentRemaining', pct * 2, this.log).catch(() => undefined);
+      const raw = pct * 2;
+      if (raw !== this.lastBatPct) {
+        this.lastBatPct = raw;
+        this.endpoint?.setAttribute('PowerSource', 'batPercentRemaining', raw, this.log).catch(() => undefined);
+      }
     });
 
     this.vacbot.on('Error', (description: string) => {
