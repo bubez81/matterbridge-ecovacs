@@ -1,6 +1,17 @@
 /**
- * matterbridge-ecovacs  v0.1.79
- * Clean rewrite with dual-source state management.
+ * matterbridge-ecovacs  v0.1.80
+ * Complete rewrite following matterbridge-roomba / matterbridge-aeg-robot patterns.
+ *
+ * Key design principles:
+ *  - updateAttribute() everywhere (has built-in deepEqual guard; never calls setStateOf for same value)
+ *  - lastPushed dedup: our own layer on top, prevents redundant calls before they reach matter.js
+ *  - 100 ms coalescing timer for operationalState (absorbs rapid transitions during stop/dock)
+ *  - 1000 ms slow queue for ServiceArea.supportedAreas (rooms arrive over ~800 ms)
+ *  - operationCompletion event triggered when cleaning ends (Apple Home state refresh)
+ *  - NO CleaningMop (68) or EmptyingDustBin (67): Matter 1.4 states not supported by
+ *    Apple Home HomePod firmware; map mop-wash/dry and auto-empty to chargeState instead
+ *  - sentErrorId sentinel: never write operationalError at startup (avoids spurious notification
+ *    from matter.js normalizing {errorStateId:0} vs internal default differently)
  */
 
 import { MatterbridgeDynamicPlatform, MatterbridgeEndpoint } from 'matterbridge';
@@ -21,24 +32,34 @@ export default function initializePlugin(matterbridge: PlatformMatterbridge, log
   return new EcovacsPlatform(matterbridge, log, config);
 }
 
+// ── Constants ──────────────────────────────────────────────────────────────────
+
 const RUN   = { IDLE: 1, CLEANING: 2 } as const;
 const CLEAN = { VACUUM: 1, MOP: 2, VACUUM_AND_MOP: 3, VACUUM_THEN_MOP: 4 } as const;
 const OpState = RvcOperationalState.OperationalState;
 const RECONNECT_DELAYS = [5_000, 15_000, 30_000, 60_000, 120_000];
 
+// ── State-mapping helpers ──────────────────────────────────────────────────────
+
+/**
+ * Convert Ecovacs CleanReport value to RVC OperationalState.
+ * CleaningMop (68) and EmptyingDustBin (67) are Matter 1.4 — NOT mapped here;
+ * mop-wash/drying/auto-empty all return Stopped so chargeState wins in applyState.
+ */
 function cleanReportToOpState(v: string): number {
   switch (v) {
     case 'auto': case 'spot_area': case 'custom_area': case 'entrust':
     case 'freeClean': case 'qcClean': case 'spot': case 'area':
     case 'singlePoint': case 'move': case 'comeClean':
       return OpState.Running;
-    case 'pause':      return OpState.Paused;
-    case 'returning':  case 'goCharging': return OpState.SeekingCharger;
-    // CleaningMop (68) and EmptyingDustBin (67) are Matter 1.4 states not recognized
-    // by Apple Home (iOS 18.4 HomePod firmware) — they cause permanent "Aggiornamento".
-    // Map mop-wash and drying phases to Stopped so chargeState wins in applyState.
-    case 'washing': case 'drying': case 'airdrying': return OpState.Stopped;
-    default:           return OpState.Stopped;
+    case 'pause':
+      return OpState.Paused;
+    case 'returning': case 'goCharging':
+      return OpState.SeekingCharger;
+    default:
+      // washing / drying / airdrying / idle / undefined → Stopped
+      // chargeState (Charging or Docked) will be the resolved state in applyState
+      return OpState.Stopped;
   }
 }
 
@@ -50,20 +71,19 @@ function chargeStateToOpState(v: string): number {
   }
 }
 
-/** Map Ecovacs error code to Matter RVC ErrorState */
+/** Map Ecovacs error code to Matter RvcOperationalState ErrorState */
 function ecovacsErrorToMatterError(code: number): number {
   const E = RvcOperationalState.ErrorState;
   switch (code) {
     case 0: case 100: return E.NoError;
     case 101:         return E.LowBattery;
-    case 103:         return E.WheelsJammed;
+    case 103:         return E.NavigationSensorObscured;
     case 104:         return E.NavigationSensorObscured;
     case 105:         return E.Stuck;
     case 108: case 109: return E.BrushJammed;
     case 110:         return E.DustBinMissing;
     case 114:         return E.DustBinFull;
-    case 120: case 126: return E.WaterTankMissing;
-    case 125:         return E.WaterTankMissing;
+    case 120: case 125: case 126: return E.WaterTankMissing;
     case 128: case 129: return E.MopCleaningPadMissing;
     case 301:         return E.WaterTankEmpty;
     case 302: case 305: return E.DirtyWaterTankFull;
@@ -77,6 +97,8 @@ function isActiveCleaning(s: number): boolean {
   return s === OpState.Running || s === OpState.Paused;
 }
 
+// ── Interfaces ────────────────────────────────────────────────────────────────
+
 interface EcovacsVacuumInfo { did: string; nick: string; deviceName: string; resource?: string; class?: string; }
 interface RoomConfig { id: string; name?: string; enabled?: boolean; }
 interface EcovacsConfig extends PlatformConfig {
@@ -85,6 +107,8 @@ interface EcovacsConfig extends PlatformConfig {
   pollingInterval?: number; rooms?: RoomConfig[];
 }
 
+// ── EcovacsDevice ─────────────────────────────────────────────────────────────
+
 class EcovacsDevice {
   private vacbot: any = null;
   private endpoint: RoboticVacuumCleaner | null = null;
@@ -92,44 +116,57 @@ class EcovacsDevice {
   // Dual-source state: cleanState from CleanReport, chargeState from ChargeState
   private cleanState:  number = OpState.Stopped;
   private chargeState: number = OpState.Docked;
-  private opState:     number = OpState.Docked;
 
-  // -1 = never sent; >0 = error active; 0 = NoError last sent after clearing error.
-  // We only write operationalError for real errors (errId > 0) and when clearing
-  // after a real error (sentErrorId > 0 → errId = 0). Never written for NoError
-  // at startup, so matter.js keeps its default and Apple Home stays happy.
+  // Current error (used when cleanState === Error)
+  private currentErrorId: number = RvcOperationalState.ErrorState.NoError;
+
+  // -1 = never sent; >0 = error was sent; 0 = NoError sent after clearing error.
+  // We NEVER write operationalError unless there is (or was) a real error.
+  // Writing NoError at startup causes matter.js to send a spurious subscription
+  // notification (internal struct normalization differs from cluster default).
   private sentErrorId: number = -1;
 
-  private runMode:   number = RUN.IDLE;
-  private cleanMode: number = CLEAN.VACUUM;
+  // lastPushed: track the last value we actually sent to matter.js for each attribute.
+  // updateAttribute() has its own deepEqual guard but we add this layer so we never
+  // even call updateAttribute() with a value we've already sent — matches matterbridge-roomba.
+  private lastPushed = {
+    opState:     -1,   // RvcOperationalState.operationalState  (-1 = never sent)
+    batPct:      -1,   // PowerSource.batPercentRemaining        (-1 = never sent)
+    batCharge:   -1,   // PowerSource.batChargeState             (-1 = never sent)
+    runMode:     -1,   // RvcRunMode.currentMode                 (-1 = never sent)
+  };
+  // supportedAreas is a JSON-serialized string for comparison
+  private lastPushedAreas: string = '';
 
-  private matterIdToEcovacsId: Map<number, string> = new Map();
-  private selectedAreaIds: string[] = [];
+  // operationalState coalescing: 100 ms window absorbs rapid transitions
+  // (Running → Paused → SeekingCharger during a stop command)
+  private pendingOpState: number | null = null;
+  private opStateTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Tracks last-sent value per attribute (JSON-serialized) to skip redundant
-  // setAttribute calls — matter.js 0.17.2 sends subscription notifications even
-  // for same-value writes, which makes Apple Home show "Aggiornamento".
-  private sentAttrs: Map<string, string> = new Map();
+  // supportedAreas coalescing: 1000 ms window (rooms arrive over ~800 ms from robot)
+  private pendingAreas: any[] | null = null;
+  private areasTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Fast queue (50ms): all attributes except ServiceArea.
-  private pendingAttrs: Map<string, { cluster: string; attr: string; value: any; serialized: string }> = new Map();
-  private pendingTimer: ReturnType<typeof setTimeout> | null = null;
+  // Tracks whether the last sent opState was "active" (Running/Paused/SeekingCharger)
+  // Used to trigger operationCompletion when cleaning ends (Apple Home refresh)
+  private wasActiveCleaning = false;
 
-  // Slow queue (1000ms): ServiceArea only. Rooms arrive over ~800ms so we need
-  // a wider window to coalesce all 9 events into a single setAttribute call.
-  private pendingSlowAttrs: Map<string, { cluster: string; attr: string; value: any; serialized: string }> = new Map();
-  private pendingSlowTimer: ReturnType<typeof setTimeout> | null = null;
-
+  // Room discovery
   private rooms: Map<string, string> = new Map();
   private roomsLoaded = false;
   private roomsExpected = 0;
+  private matterIdToEcovacsId: Map<number, string> = new Map();
+  private selectedAreaIds: string[] = [];
 
-  private currentErrorId: number = RvcOperationalState.ErrorState.NoError;
-
+  // Connection management
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private shuttingDown = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Clean mode selections
+  private runMode:   number = RUN.IDLE;
+  private cleanMode: number = CLEAN.VACUUM;
 
   onRoomsDiscovered?: (rooms: RoomConfig[]) => void;
 
@@ -141,24 +178,30 @@ class EcovacsDevice {
     private readonly roomsConfig: RoomConfig[] = [],
   ) {
     if (roomsConfig.length > 0) {
-      // Rooms already in config: mark as loaded so GetMaps is skipped entirely.
-      // This prevents supportedAreas from ever changing after startup, eliminating
-      // the [] → [N rooms] write that causes Apple Home "Aggiornamento".
+      // Pre-load rooms from config: skip GetMaps entirely and pre-set lastPushedAreas
+      // so the first updateServiceAreas call sees no delta and makes no write.
+      // This prevents the [] → [N rooms] transition that triggers Apple Home "Aggiornamento".
       this.roomsLoaded = true;
       const areas = this.buildAreasFromConfig();
-      this.sentAttrs.set('ServiceArea.supportedAreas', JSON.stringify(areas));
+      this.lastPushedAreas = JSON.stringify(areas);
     }
   }
 
-  // Build the supportedAreas array from roomsConfig in a stable, deterministic order.
-  // Used both for pre-populating sentAttrs and for initializing the endpoint.
+  /** Build supportedAreas array from roomsConfig in stable, deterministic order. */
   buildAreasFromConfig(): any[] {
     return this.roomsConfig
       .filter(r => r.enabled !== false)
       .map(r => {
         const matterAreaId = (parseInt(r.id, 10) || 0) + 1;
         this.matterIdToEcovacsId.set(matterAreaId, r.id);
-        return { areaId: matterAreaId, mapId: null, areaInfo: { locationInfo: { locationName: r.name?.trim() || r.id, floorNumber: 0, areaType: null }, landmarkInfo: null } };
+        return {
+          areaId: matterAreaId,
+          mapId: null,
+          areaInfo: {
+            locationInfo: { locationName: r.name?.trim() || r.id, floorNumber: 0, areaType: null },
+            landmarkInfo: null,
+          },
+        };
       });
   }
 
@@ -166,102 +209,142 @@ class EcovacsDevice {
 
   bindEndpoint(ep: RoboticVacuumCleaner): void {
     this.endpoint = ep;
-    this.sentAttrs.clear(); // force full re-sync: new endpoint starts with default values
-    this.opState = -1;      // force applyState to re-send operationalState
-    this.sentErrorId = -1;  // force re-send of active error (if any) to new endpoint
-    // Re-populate ServiceArea.supportedAreas from config after the clear, so that
-    // updateServiceAreas skips the redundant write when rooms arrive from the robot.
+    // Reset lastPushed: new endpoint starts at default values, force full re-sync
+    this.lastPushed = { opState: -1, batPct: -1, batCharge: -1, runMode: -1 };
+    this.lastPushedAreas = '';
+    this.sentErrorId = -1;
+    this.wasActiveCleaning = false;
+    // Re-populate areas cache from config after reset so first updateServiceAreas finds no delta
     if (this.roomsConfig.length > 0) {
       const areas = this.buildAreasFromConfig();
-      this.sentAttrs.set('ServiceArea.supportedAreas', JSON.stringify(areas));
+      this.lastPushedAreas = JSON.stringify(areas);
     }
     this.registerHandlers();
   }
 
-  // Coalesce rapid setAttribute calls. Skip if value unchanged (sentAttrs cache).
-  // slow=true uses a 1000ms window (ServiceArea rooms arrive over ~800ms).
-  // slow=false uses 50ms. Runs sequentially (await) to avoid concurrent transactions.
-  private scheduleAttr(cluster: string, attr: string, value: any, slow = false): void {
-    const key = `${cluster}.${attr}`;
-    const serialized = JSON.stringify(value);
-    if (this.sentAttrs.get(key) === serialized) return;
+  // ── Attribute writers ────────────────────────────────────────────────────────
 
-    if (slow) {
-      this.pendingSlowAttrs.set(key, { cluster, attr, value, serialized });
-      if (!this.pendingSlowTimer) {
-        this.pendingSlowTimer = setTimeout(async () => {
-          this.pendingSlowTimer = null;
-          const batch = [...this.pendingSlowAttrs.values()];
-          this.pendingSlowAttrs.clear();
-          for (const { cluster: c, attr: a, value: v, serialized: s } of batch) {
-            this.sentAttrs.set(`${c}.${a}`, s); // set before await to block concurrent duplicates
-            await this.endpoint?.setAttribute(c, a, v, this.log).catch(() => this.sentAttrs.delete(`${c}.${a}`));
-          }
-        }, 1000);
+  /**
+   * Write operationalState to matter.js via updateAttribute (deepEqual built-in).
+   * 100 ms coalescing absorbs rapid state transitions (multiple events within 100 ms
+   * all collapse into a single write with the LAST value — "last write wins").
+   * Also triggers operationCompletion event when cleaning ends.
+   */
+  private scheduleOpState(s: number): void {
+    this.pendingOpState = s;
+    if (this.opStateTimer) return; // timer already running; last-write-wins
+    this.opStateTimer = setTimeout(async () => {
+      this.opStateTimer = null;
+      const val = this.pendingOpState!;
+      this.pendingOpState = null;
+      if (val === this.lastPushed.opState) return;
+      const prevWasActive = this.wasActiveCleaning;
+      const nowActive = val === OpState.Running || val === OpState.Paused || val === OpState.SeekingCharger;
+      this.lastPushed.opState = val;
+      this.wasActiveCleaning = nowActive;
+      const label = (RvcOperationalState.OperationalState as Record<number, string>)[val] ?? String(val);
+      this.log.info(`[${this.name}] opState → ${label}`);
+      await this.endpoint?.updateAttribute('RvcOperationalState', 'operationalState', val, this.log);
+      // Trigger operationCompletion when transitioning from active cleaning to idle/charging.
+      // This forces Apple Home to refresh device state, clearing any "Aggiornamento" caused
+      // by the rapid subscription notifications during the cleaning cycle.
+      if (prevWasActive && !nowActive) {
+        this.log.info(`[${this.name}] operationCompletion`);
+        await this.endpoint?.triggerEvent('RvcOperationalState', 'operationCompletion', {
+          completionErrorCode: 0,
+          totalOperationalTime: null,
+          pausedTime: null,
+        }, this.log);
       }
-    } else {
-      this.pendingAttrs.set(key, { cluster, attr, value, serialized });
-      if (!this.pendingTimer) {
-        this.pendingTimer = setTimeout(async () => {
-          this.pendingTimer = null;
-          const batch = [...this.pendingAttrs.values()];
-          this.pendingAttrs.clear();
-          for (const { cluster: c, attr: a, value: v, serialized: s } of batch) {
-            this.sentAttrs.set(`${c}.${a}`, s); // set before await to block concurrent duplicates
-            await this.endpoint?.setAttribute(c, a, v, this.log).catch(() => this.sentAttrs.delete(`${c}.${a}`));
-          }
-        }, 50);
-      }
-    }
+    }, 100);
   }
 
-  // State resolution: CleanReport wins for active states, ChargeState wins otherwise
-  private applyState(): void {
-    // CleanReport wins for Running/Paused/SeekingCharger. ChargeState wins for everything
-    // else (docked, charging, mop-wash, bin-empty). Never send states 67/68 to Apple Home.
-    const resolved = (isActiveCleaning(this.cleanState) || this.cleanState === OpState.SeekingCharger)
-      ? this.cleanState : this.chargeState;
-
-    // Write operationalError only when strictly necessary:
-    // - if there's a real error (errId > 0) and it changed: send it
-    // - if the error cleared (errId = 0) and we had previously sent one: send the clear
-    // - on startup with no error (errId = 0, sentErrorId = -1): do nothing
-    // This avoids matter.js 0.17.2 triggering Apple Home "Aggiornamento" by never
-    // writing the default NoError value (which matter.js normalizes differently
-    // than its own cluster default, causing a spurious subscription notification).
-    const errId = resolved === OpState.Error
+  /** Write operationalError only when strictly necessary (never at startup with NoError). */
+  private applyError(): void {
+    const errId = this.cleanState === OpState.Error
       ? this.currentErrorId
       : RvcOperationalState.ErrorState.NoError;
-    if (errId !== 0) {
+
+    if (errId > 0) {
       if (errId !== this.sentErrorId) {
         this.sentErrorId = errId;
-        this.scheduleAttr('RvcOperationalState', 'operationalError',
-          { errorStateId: errId, errorStateLabel: undefined, errorStateDetails: undefined });
+        this.endpoint?.updateAttribute('RvcOperationalState', 'operationalError',
+          { errorStateId: errId, errorStateLabel: undefined, errorStateDetails: undefined }, this.log);
       }
     } else if (this.sentErrorId > 0) {
       // Had a real error, now clearing it
       this.sentErrorId = 0;
-      this.scheduleAttr('RvcOperationalState', 'operationalError',
-        { errorStateId: 0, errorStateLabel: undefined, errorStateDetails: undefined });
+      this.endpoint?.updateAttribute('RvcOperationalState', 'operationalError',
+        { errorStateId: 0, errorStateLabel: undefined, errorStateDetails: undefined }, this.log);
     }
-    // errId === 0 and sentErrorId <= 0: no-op — don't touch operationalError
-
-    if (resolved === this.opState) return;
-    this.opState = resolved;
-    const label = (RvcOperationalState.OperationalState as Record<number, string>)[resolved] ?? String(resolved);
-    this.log.info(`[${this.name}] opState → ${label}`);
-    this.scheduleAttr('RvcOperationalState', 'operationalState', resolved);
+    // errId === 0 and sentErrorId ≤ 0: startup case — do nothing
   }
+
+  private writeBattery(pct: number, charge: number): void {
+    if (pct !== this.lastPushed.batPct) {
+      this.lastPushed.batPct = pct;
+      this.endpoint?.updateAttribute('PowerSource', 'batPercentRemaining', pct, this.log);
+    }
+    if (charge !== this.lastPushed.batCharge) {
+      this.lastPushed.batCharge = charge;
+      this.endpoint?.updateAttribute('PowerSource', 'batChargeState', charge, this.log);
+    }
+  }
+
+  private writeRunMode(m: number): void {
+    if (m === this.lastPushed.runMode) return;
+    this.lastPushed.runMode = m;
+    this.endpoint?.updateAttribute('RvcRunMode', 'currentMode', m, this.log);
+  }
+
+  /** Queue supportedAreas write with 1000 ms debounce (rooms arrive over ~800 ms). */
+  private scheduleAreas(areas: any[]): void {
+    this.pendingAreas = areas;
+    if (this.areasTimer) return;
+    this.areasTimer = setTimeout(async () => {
+      this.areasTimer = null;
+      const a = this.pendingAreas!;
+      this.pendingAreas = null;
+      const serialized = JSON.stringify(a);
+      if (serialized === this.lastPushedAreas) return;
+      this.lastPushedAreas = serialized;
+      this.log.info(`[${this.name}] supportedAreas → ${a.length} rooms`);
+      await this.endpoint?.updateAttribute('ServiceArea', 'supportedAreas', a, this.log);
+    }, 1000);
+  }
+
+  // ── State resolution ─────────────────────────────────────────────────────────
+
+  /**
+   * Resolve the final operationalState and push it + error state to matter.js.
+   * CleanReport wins for Running / Paused / SeekingCharger.
+   * ChargeState wins for everything else (including mop-wash, auto-empty, idle).
+   * States 67 (EmptyingDustBin) and 68 (CleaningMop) are never emitted —
+   * they are Matter 1.4 values that Apple Home HomePod doesn't recognize.
+   */
+  private applyState(): void {
+    const resolved = (isActiveCleaning(this.cleanState) || this.cleanState === OpState.SeekingCharger)
+      ? this.cleanState
+      : this.chargeState;
+    this.applyError();
+    this.scheduleOpState(resolved);
+  }
+
+  // ── Connection ───────────────────────────────────────────────────────────────
 
   async connect(): Promise<void> {
     if (this.shuttingDown) return;
     this.log.info(`[${this.name}] Connecting (attempt ${this.reconnectAttempt + 1})`);
     try { this.vacbot = this.api.getVacBotObj(this.vacuum); }
-    catch (err) { this.log.error(`[${this.name}] getVacBotObj failed: ${String(err)}`); this.scheduleReconnect(); return; }
+    catch (err) {
+      this.log.error(`[${this.name}] getVacBotObj failed: ${String(err)}`);
+      this.scheduleReconnect();
+      return;
+    }
     this.listenVacbotEvents();
     this.vacbot.connect();
     this.vacbot.on('ready', () => {
-      this.log.info(`[${this.name}] Connected — refreshing state in 3s`);
+      this.log.info(`[${this.name}] Connected — refreshing state in 3 s`);
       this.reconnectAttempt = 0;
       setTimeout(() => {
         if (this.shuttingDown) return;
@@ -269,7 +352,7 @@ class EcovacsDevice {
         this.vacbot?.run('GetChargeState');
         this.vacbot?.run('GetCleanState_V2');
         if (!this.roomsLoaded) this.vacbot?.run('GetMaps');
-        this.startPolling(); // poll every 15s at startup
+        this.startPolling();
       }, 3000);
     });
     this.vacbot.on('Error', (msg: string) => {
@@ -281,13 +364,17 @@ class EcovacsDevice {
     });
     this.vacbot.on('disconnect', () => {
       this.log.warn(`[${this.name}] Disconnected`);
-      this.stopPolling(); this.scheduleReconnect();
+      this.stopPolling();
+      this.scheduleReconnect();
     });
   }
 
   async disconnect(): Promise<void> {
-    this.shuttingDown = true; this.stopPolling();
+    this.shuttingDown = true;
+    this.stopPolling();
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.opStateTimer)   { clearTimeout(this.opStateTimer);   this.opStateTimer = null; }
+    if (this.areasTimer)     { clearTimeout(this.areasTimer);      this.areasTimer = null; }
     try { if (this.vacbot) await this.vacbot.disconnectAsync(); } catch { /* ignore */ }
   }
 
@@ -302,82 +389,79 @@ class EcovacsDevice {
     }, delay);
   }
 
+  // ── Event handlers ───────────────────────────────────────────────────────────
+
   private listenVacbotEvents(): void {
+
     this.vacbot.on('CleanReport', (v: string) => {
       this.log.info(`[${this.name}] CleanReport: ${v}`);
       const s = cleanReportToOpState(v);
       this.cleanState = s;
       this.applyState();
-      this.setRunMode(isActiveCleaning(s) ? RUN.CLEANING : RUN.IDLE);
+      this.writeRunMode(isActiveCleaning(s) ? RUN.CLEANING : RUN.IDLE);
     });
 
     this.vacbot.on('ChargeState', (v: string) => {
       this.log.info(`[${this.name}] ChargeState: ${v}`);
       const s = chargeStateToOpState(v);
       this.chargeState = s;
-
+      // Reset cleanState to Stopped when charging starts (unless actively cleaning)
       if (s === OpState.Charging && !isActiveCleaning(this.cleanState)) {
         this.cleanState = OpState.Stopped;
-        this.setRunMode(RUN.IDLE);
+        this.writeRunMode(RUN.IDLE);
       } else if (s === OpState.Docked && !isActiveCleaning(this.cleanState) && this.cleanState !== OpState.SeekingCharger) {
         this.cleanState = OpState.Stopped;
-        this.setRunMode(RUN.IDLE);
+        this.writeRunMode(RUN.IDLE);
       }
-
       this.applyState();
-      const bat = s === OpState.Charging ? PowerSource.BatChargeState.IsCharging : PowerSource.BatChargeState.IsNotCharging;
-      this.scheduleAttr('PowerSource', 'batChargeState', bat);
+      const chargeAttr = s === OpState.Charging ? PowerSource.BatChargeState.IsCharging : PowerSource.BatChargeState.IsNotCharging;
+      if (chargeAttr !== this.lastPushed.batCharge) {
+        this.lastPushed.batCharge = chargeAttr;
+        this.endpoint?.updateAttribute('PowerSource', 'batChargeState', chargeAttr, this.log);
+      }
     });
 
     this.vacbot.on('BatteryInfo', (level: number) => {
-      const pct = Math.max(0, Math.min(100, Math.round(level)));
-      this.scheduleAttr('PowerSource', 'batPercentRemaining', pct * 2);
+      const pct = Math.max(0, Math.min(200, Math.round(level) * 2));
+      if (pct !== this.lastPushed.batPct) {
+        this.lastPushed.batPct = pct;
+        this.endpoint?.updateAttribute('PowerSource', 'batPercentRemaining', pct, this.log);
+      }
+    });
+
+    this.vacbot.on('ErrorCode', (code: number) => {
+      this.log.warn(`[${this.name}] ErrorCode: ${code}`);
+      if (code === 0 || code === 100) {
+        this.currentErrorId = RvcOperationalState.ErrorState.NoError;
+        this.applyState();
+        return;
+      }
+      this.currentErrorId = ecovacsErrorToMatterError(code);
+      this.cleanState = OpState.Error;
+      this.applyState();
     });
 
     this.vacbot.on('Error', (description: string) => {
       this.log.warn(`[${this.name}] Robot error: ${description}`);
     });
 
-    this.vacbot.on('ErrorCode', (code: number) => {
-      this.log.warn(`[${this.name}] ErrorCode: ${code}`);
-      if (code === 0 || code === 100) {
-        // NoError — clear stored error and let applyState() propagate NoError
-        this.currentErrorId = RvcOperationalState.ErrorState.NoError;
-        this.applyState();
-        return;
-      }
-      const errorStateId = ecovacsErrorToMatterError(code);
-      this.currentErrorId = errorStateId;
-      this.cleanState = OpState.Error;
-      this.applyState();
-    });
-
+    // MopWash and EmptyDustBin: the robot is at the dock.
+    // chargeState (Charging or Docked) wins in applyState — no state change needed.
+    // States 68 (CleaningMop) and 67 (EmptyingDustBin) are Matter 1.4, not supported by
+    // Apple Home HomePod firmware. Sending them causes permanent "Aggiornamento".
     this.vacbot.on('MopWash', (v: string) => {
-      // MopWash state is handled via CleanReport: washing → Stopped (chargeState wins)
-      this.log.info(`[${this.name}] MopWash: ${v}`);
-    });
-
-    // CurrentStats fires during cleaning — use it as a Running indicator
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    this.vacbot.on('CurrentStats', (v: any) => {
-      this.log.info(`[${this.name}] CurrentStats: type=${v?.cleanType}`);
-      const cleanType = v?.cleanType;
-      if (cleanType === 'spotArea' || cleanType === 'auto' || cleanType === 'customArea' || cleanType === 'freeClean') {
-        if (this.cleanState !== OpState.Running) {
-          this.cleanState = OpState.Running;
-          this.applyState();
-          this.setRunMode(RUN.CLEANING);
-        }
-      }
+      this.log.info(`[${this.name}] MopWash: ${v} — robot at dock, chargeState wins`);
     });
 
     this.vacbot.on('EmptyDustBin', (v: string) => {
-      // Auto-empty at dock: robot stays in Charging/Docked — no state change needed
-      this.log.info(`[${this.name}] EmptyDustBin: ${v}`);
+      this.log.info(`[${this.name}] EmptyDustBin: ${v} — robot at dock, chargeState wins`);
     });
 
-    this.vacbot.on('StatusInfo', (v: unknown) => { this.log.debug(`[${this.name}] StatusInfo: ${JSON.stringify(v)}`); });
+    this.vacbot.on('StatusInfo', (v: unknown) => {
+      this.log.debug(`[${this.name}] StatusInfo: ${JSON.stringify(v)}`);
+    });
 
+    // Room / map discovery
     this.vacbot.on('CurrentMapMID', (mapID: string) => {
       if (this.roomsLoaded) return;
       this.vacbot.run('GetSpotAreas', mapID);
@@ -409,7 +493,10 @@ class EcovacsDevice {
     this.vacbot.on('MapSpotAreaInfo', (info: any) => {
       const id = String(info?.mapSpotAreaID ?? info?.spotAreaID ?? info?.id ?? '');
       const name = info?.customName || info?.mapSpotAreaName || info?.name || `Area ${id}`;
-      if (id) { this.rooms.set(id, name); this.updateServiceAreas(); }
+      if (id) {
+        this.rooms.set(id, name);
+        this.updateServiceAreas();
+      }
     });
   }
 
@@ -424,8 +511,7 @@ class EcovacsDevice {
       this.onRoomsDiscovered = undefined;
     }
 
-    // When roomsConfig is available, iterate in roomsConfig order for a stable JSON
-    // that matches the pre-populated sentAttrs value → no redundant setAttribute.
+    // Iterate in roomsConfig order for stable JSON that matches lastPushedAreas
     let entries: [string, string][];
     if (this.roomsConfig.length > 0) {
       entries = this.roomsConfig
@@ -437,16 +523,22 @@ class EcovacsDevice {
 
     this.matterIdToEcovacsId.clear();
     const areas = entries.map(([ecoId, name]) => {
-      // Use Ecovacs numeric ID as Matter areaId for stability across restarts
-      // This ensures Apple Home scenes always point to the correct room
-      const matterAreaId = (parseInt(ecoId, 10) || 0) + 1; // +1 to avoid 0
+      const matterAreaId = (parseInt(ecoId, 10) || 0) + 1;
       this.matterIdToEcovacsId.set(matterAreaId, ecoId);
-      return { areaId: matterAreaId, mapId: null, areaInfo: { locationInfo: { locationName: name, floorNumber: 0, areaType: null }, landmarkInfo: null } };
+      return {
+        areaId: matterAreaId,
+        mapId: null,
+        areaInfo: {
+          locationInfo: { locationName: name, floorNumber: 0, areaType: null },
+          landmarkInfo: null,
+        },
+      };
     });
 
-    this.log.info(`[${this.name}] ServiceArea: ${areas.length} rooms`);
-    this.scheduleAttr('ServiceArea', 'supportedAreas', areas, true);
+    this.scheduleAreas(areas);
   }
+
+  // ── Command handlers ─────────────────────────────────────────────────────────
 
   private registerHandlers(): void {
     if (!this.endpoint) return;
@@ -462,9 +554,14 @@ class EcovacsDevice {
       this.selectedAreaIds = matterIds
         .map((id: number) => this.matterIdToEcovacsId.get(id))
         .filter((id): id is string => id !== undefined);
-      this.log.info(`[${this.name}] selectAreas: ${JSON.stringify(matterIds)} → ${JSON.stringify(this.selectedAreaIds)}`);
-      setTimeout(() => {
-        this.scheduleAttr('ServiceArea', 'selectedAreas', matterIds);
+      this.log.info(`[${this.name}] selectAreas: matter=${JSON.stringify(matterIds)} → ecovacs=${JSON.stringify(this.selectedAreaIds)}`);
+      // iOS sends [] to mean "all rooms". Mirror back the full list so Apple Home
+      // doesn't store an empty selectedAreas (matterbridge-roomba iOS workaround).
+      const mirrorIds = matterIds.length === 0
+        ? Array.from(this.matterIdToEcovacsId.keys())
+        : matterIds;
+      setTimeout(async () => {
+        await this.endpoint?.updateAttribute('ServiceArea', 'selectedAreas', mirrorIds, this.log);
       }, 200);
     });
 
@@ -477,16 +574,22 @@ class EcovacsDevice {
         this.vacbot?.run('Stop');
         this.cleanState = OpState.Stopped;
         this.applyState();
-        this.setRunMode(RUN.IDLE);
+        this.writeRunMode(RUN.IDLE);
       }
     });
 
     this.endpoint.addCommandHandler('RvcOperationalState.pause', async () => {
-      this.vacbot?.run('Pause'); this.cleanState = OpState.Paused; this.applyState();
+      this.vacbot?.run('Pause');
+      this.cleanState = OpState.Paused;
+      this.applyState();
     });
+
     this.endpoint.addCommandHandler('RvcOperationalState.resume', async () => {
-      this.vacbot?.run('Resume'); this.cleanState = OpState.Running; this.applyState();
+      this.vacbot?.run('Resume');
+      this.cleanState = OpState.Running;
+      this.applyState();
     });
+
     this.endpoint.addCommandHandler('RvcOperationalState.goHome', async () => {
       this.vacbot?.run('Stop');
       await new Promise(r => setTimeout(r, 500));
@@ -497,8 +600,10 @@ class EcovacsDevice {
   }
 
   private async cmdStart(): Promise<void> {
-    this.log.info(`[${this.name}] Start (cleanMode=${this.cleanMode}, areas=${JSON.stringify(this.selectedAreaIds)}, totalRooms=${this.matterIdToEcovacsId.size})`);
-    const workMode = this.cleanMode === CLEAN.VACUUM ? 1 : this.cleanMode === CLEAN.MOP ? 2 : this.cleanMode === CLEAN.VACUUM_THEN_MOP ? 3 : 0;
+    this.log.info(`[${this.name}] Start — cleanMode=${this.cleanMode} areas=${JSON.stringify(this.selectedAreaIds)} totalRooms=${this.matterIdToEcovacsId.size}`);
+    const workMode = this.cleanMode === CLEAN.VACUUM ? 1
+      : this.cleanMode === CLEAN.MOP ? 2
+      : this.cleanMode === CLEAN.VACUUM_THEN_MOP ? 3 : 0;
     this.vacbot?.run('SetWorkMode', workMode);
 
     const allSelected = this.selectedAreaIds.length === 0 || this.selectedAreaIds.length >= this.matterIdToEcovacsId.size;
@@ -513,18 +618,15 @@ class EcovacsDevice {
 
     this.cleanState = OpState.Running;
     this.applyState();
-    this.setRunMode(RUN.CLEANING);
+    this.writeRunMode(RUN.CLEANING);
   }
 
-  private setRunMode(m: number): void {
-    if (this.runMode === m) return;
-    this.runMode = m;
-    this.scheduleAttr('RvcRunMode', 'currentMode', m);
-  }
+  // ── Polling ──────────────────────────────────────────────────────────────────
 
   private startPolling(): void {
     if (this.pollSec <= 0 || this.pollTimer) return;
     this.pollTimer = setInterval(() => {
+      if (this.shuttingDown) return;
       this.vacbot?.run('GetBatteryState');
       this.vacbot?.run('GetChargeState');
       this.vacbot?.run('GetCleanState_V2');
@@ -535,6 +637,8 @@ class EcovacsDevice {
     if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
   }
 }
+
+// ── EcovacsPlatform ───────────────────────────────────────────────────────────
 
 class EcovacsPlatform extends MatterbridgeDynamicPlatform {
   private devices: EcovacsDevice[] = [];
@@ -548,20 +652,17 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
     this.log.info(`onStart(${reason})`);
     const cfg = this.config as EcovacsConfig;
     this.log.info(`Authenticating: ${cfg.email} [${cfg.countryCode}]`);
+
     const machineIdRaw = await nodeMachineId.machineId();
-    // Server requires 32-char device ID (MD5 length), not 64-char SHA256
-    const machineId = machineIdRaw.substring(0, 32);
+    const machineId = machineIdRaw.substring(0, 32); // server requires 32-char (MD5) device ID
 
     // Patch appVersion in ecovacs-deebot to match current Ecovacs API requirements
-    // The library hardcodes '2.2.3' but the server now requires '1.6.3'
     try {
       const ecovacsPath = require.resolve('ecovacs-deebot');
-      const ecovacsDir = path.dirname(ecovacsPath);
-      const indexPath = ecovacsPath;
-      let src = fs.readFileSync(indexPath, 'utf8');
+      let src = fs.readFileSync(ecovacsPath, 'utf8');
       if (src.includes("appVersion = '2.2.3'")) {
         src = src.replace("appVersion = '2.2.3'", "appVersion = '1.6.3'");
-        fs.writeFileSync(indexPath, src, 'utf8');
+        fs.writeFileSync(ecovacsPath, src, 'utf8');
         this.log.info('Patched ecovacs-deebot appVersion to 1.6.3');
       }
     } catch (e) {
@@ -585,25 +686,6 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
       }
     } catch { /* no cache yet */ }
 
-    if (!tokenLoaded) {
-      this.log.info(`Fresh authentication: ${cfg.email} [${cfg.countryCode}]`);
-      let lastErr: unknown;
-      for (let attempt = 1; attempt <= 5; attempt++) {
-        try {
-          await api.connect(cfg.email, EcoVacsAPI.md5(cfg.password));
-          lastErr = null;
-          break;
-        } catch (err) {
-          lastErr = err;
-          const delay = attempt * 10_000;
-          this.log.warn(`Authentication failed (attempt ${attempt}/5): ${String(err)} — retrying in ${delay/1000}s`);
-          await new Promise(r => setTimeout(r, delay));
-        }
-      }
-      if (lastErr) throw lastErr;
-    }
-
-    // Helper to save token
     const saveToken = () => {
       try {
         fs.writeFileSync(tokenFile, JSON.stringify({
@@ -615,30 +697,44 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
       } catch { /* ignore */ }
     };
 
-    // Save token if we just authenticated fresh
-    if (!tokenLoaded) saveToken();
+    if (!tokenLoaded) {
+      this.log.info(`Fresh authentication: ${cfg.email} [${cfg.countryCode}]`);
+      let lastErr: unknown;
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          await api.connect(cfg.email, EcoVacsAPI.md5(cfg.password));
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          const delay = attempt * 10_000;
+          this.log.warn(`Auth failed (attempt ${attempt}/5): ${String(err)} — retrying in ${delay / 1000}s`);
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+      if (lastErr) throw lastErr;
+      saveToken();
+    }
 
-    // If we used a cached token, verify it works — if not, re-authenticate
     let devices: EcovacsVacuumInfo[];
     try {
       devices = await api.devices();
     } catch (err) {
-      if (tokenLoaded) {
-        this.log.warn(`Cached token expired or invalid — re-authenticating...`);
-        try { fs.unlinkSync(tokenFile); } catch { /* ignore */ }
-        await api.connect(cfg.email, EcoVacsAPI.md5(cfg.password));
-        saveToken();
-        this.log.info('Auth token refreshed and cached');
-        devices = await api.devices();
-      } else {
-        throw err;
-      }
+      if (!tokenLoaded) throw err;
+      this.log.warn(`Cached token expired — re-authenticating…`);
+      try { fs.unlinkSync(tokenFile); } catch { /* ignore */ }
+      await api.connect(cfg.email, EcoVacsAPI.md5(cfg.password));
+      saveToken();
+      devices = await api.devices();
     }
+
     const filtered = cfg.whiteList?.length
       ? devices.filter(d => cfg.whiteList!.includes(d.did) || cfg.whiteList!.includes(d.nick))
       : devices;
     this.log.info(`Found ${filtered.length} Ecovacs device(s)`);
-    for (const vac of filtered) await this.registerVacuum(api, vac, cfg.pollingInterval ?? 15, cfg.rooms ?? []);
+    for (const vac of filtered) {
+      await this.registerVacuum(api, vac, cfg.pollingInterval ?? 15, cfg.rooms ?? []);
+    }
   }
 
   async onStop(reason?: string): Promise<void> {
@@ -653,8 +749,8 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
     const name = vac.nick || vac.deviceName || vac.did;
     this.log.info(`Registering: "${name}" (${vac.did})`);
 
-    // Build device first so buildAreasFromConfig() can populate matterIdToEcovacsId.
     const device = new EcovacsDevice(api, vac, pollSec, this.log, roomsConfig);
+
     if (roomsConfig.length === 0) {
       device.onRoomsDiscovered = (disc: RoomConfig[]) => {
         const updated = { ...this.config, rooms: disc } as EcovacsConfig;
@@ -663,8 +759,8 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
       };
     }
 
-    // Pre-build areas from config so the endpoint starts with the correct value.
-    // This avoids the [] → [N rooms] write that triggers Apple Home "Aggiornamento".
+    // Pre-build areas from config so the endpoint is initialized with the correct list.
+    // This prevents the [] → [N rooms] transition that triggers Apple Home "Aggiornamento".
     const initialAreas = device.buildAreasFromConfig();
 
     const endpoint = new RoboticVacuumCleaner(
@@ -681,7 +777,7 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
         { label: 'Vacuum and Mop',  mode: CLEAN.VACUUM_AND_MOP,  modeTags: [{ value: RvcCleanMode.ModeTag.Vacuum }, { value: RvcCleanMode.ModeTag.Mop }] },
         { label: 'Vacuum then Mop', mode: CLEAN.VACUUM_THEN_MOP, modeTags: [{ value: RvcCleanMode.ModeTag.VacuumThenMop }] },
       ],
-      null, null,
+      null, null,          // currentPhase, phaseList
       OpState.Docked,
       [
         { operationalStateId: OpState.Stopped },
@@ -691,15 +787,18 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
         { operationalStateId: OpState.SeekingCharger },
         { operationalStateId: OpState.Charging },
         { operationalStateId: OpState.Docked },
-        // CleaningMop (68) and EmptyingDustBin (67) are Matter 1.4 states not
-        // supported by Apple Home HomePod firmware — omitted to prevent "Aggiornamento".
+        // CleaningMop (68) and EmptyingDustBin (67) intentionally omitted:
+        // Matter 1.4 states not supported by Apple Home HomePod firmware.
       ],
-      initialAreas, [], null, [],
+      initialAreas,
+      [],                  // selectedAreas
+      null,                // currentArea
+      [],                  // supportedMaps
     );
 
     device.bindEndpoint(endpoint);
     this.devices.push(device);
     await this.registerDevice(endpoint as unknown as MatterbridgeEndpoint);
-    device.connect().catch((err: unknown) => this.log.error(`[${name}] Initial connect failed: ${String(err)}`));
+    device.connect().catch((err: unknown) => this.log.error(`[${name}] connect failed: ${String(err)}`));
   }
 }
