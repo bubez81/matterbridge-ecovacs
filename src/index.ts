@@ -182,6 +182,10 @@ class EcovacsDevice {
     const key = `${cluster}.${attr}`;
     const serialized = JSON.stringify(value);
     if (this.sentAttrs.get(key) === serialized) return;
+    if (key === 'ServiceArea.supportedAreas') {
+      const prev = this.sentAttrs.get(key);
+      this.log.warn(`[${this.name}] DBG supportedAreas sentAttrs=${prev === undefined ? 'EMPTY' : prev.substring(0, 80)} newJSON=${serialized.substring(0, 80)}`);
+    }
 
     if (slow) {
       this.pendingSlowAttrs.set(key, { cluster, attr, value, serialized });
