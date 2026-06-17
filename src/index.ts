@@ -1,5 +1,5 @@
 /**
- * matterbridge-ecovacs  v0.1.37
+ * matterbridge-ecovacs  v0.1.79
  * Clean rewrite with dual-source state management.
  */
 
@@ -34,8 +34,10 @@ function cleanReportToOpState(v: string): number {
       return OpState.Running;
     case 'pause':      return OpState.Paused;
     case 'returning':  case 'goCharging': return OpState.SeekingCharger;
-    case 'washing':              return OpState.CleaningMop;
-    case 'drying': case 'airdrying': return OpState.Docked;
+    // CleaningMop (68) and EmptyingDustBin (67) are Matter 1.4 states not recognized
+    // by Apple Home (iOS 18.4 HomePod firmware) — they cause permanent "Aggiornamento".
+    // Map mop-wash and drying phases to Stopped so chargeState wins in applyState.
+    case 'washing': case 'drying': case 'airdrying': return OpState.Stopped;
     default:           return OpState.Stopped;
   }
 }
@@ -215,12 +217,10 @@ class EcovacsDevice {
 
   // State resolution: CleanReport wins for active states, ChargeState wins otherwise
   private applyState(): void {
-    const resolved = (
-      isActiveCleaning(this.cleanState) ||
-      this.cleanState === OpState.SeekingCharger ||
-      this.cleanState === OpState.CleaningMop ||
-      this.cleanState === OpState.EmptyingDustBin
-    ) ? this.cleanState : this.chargeState;
+    // CleanReport wins for Running/Paused/SeekingCharger. ChargeState wins for everything
+    // else (docked, charging, mop-wash, bin-empty). Never send states 67/68 to Apple Home.
+    const resolved = (isActiveCleaning(this.cleanState) || this.cleanState === OpState.SeekingCharger)
+      ? this.cleanState : this.chargeState;
 
     // Write operationalError only when strictly necessary:
     // - if there's a real error (errId > 0) and it changed: send it
@@ -316,23 +316,13 @@ class EcovacsDevice {
       const s = chargeStateToOpState(v);
       this.chargeState = s;
 
-      if (s === OpState.Charging) {
-        // Robot is charging — only reset if not actively cleaning
-        if (!isActiveCleaning(this.cleanState) && this.cleanState !== OpState.CleaningMop) {
-          this.cleanState = OpState.Stopped;
-          this.setRunMode(RUN.IDLE);
-        }
-      } else if (s === OpState.Docked) {
-        // ChargeState: idle — only reset cleanState if not actively cleaning
-        // When robot is cleaning, ChargeState is "idle" too — don't override Running!
-        if (!isActiveCleaning(this.cleanState) &&
-            this.cleanState !== OpState.CleaningMop &&
-            this.cleanState !== OpState.SeekingCharger) {
-          this.cleanState = OpState.Stopped;
-          this.setRunMode(RUN.IDLE);
-        }
+      if (s === OpState.Charging && !isActiveCleaning(this.cleanState)) {
+        this.cleanState = OpState.Stopped;
+        this.setRunMode(RUN.IDLE);
+      } else if (s === OpState.Docked && !isActiveCleaning(this.cleanState) && this.cleanState !== OpState.SeekingCharger) {
+        this.cleanState = OpState.Stopped;
+        this.setRunMode(RUN.IDLE);
       }
-      // SeekingCharger: don't override cleanState — CleanReport handles it
 
       this.applyState();
       const bat = s === OpState.Charging ? PowerSource.BatChargeState.IsCharging : PowerSource.BatChargeState.IsNotCharging;
@@ -363,7 +353,8 @@ class EcovacsDevice {
     });
 
     this.vacbot.on('MopWash', (v: string) => {
-      if (v === 'washing') { this.cleanState = OpState.CleaningMop; this.applyState(); }
+      // MopWash state is handled via CleanReport: washing → Stopped (chargeState wins)
+      this.log.info(`[${this.name}] MopWash: ${v}`);
     });
 
     // CurrentStats fires during cleaning — use it as a Running indicator
@@ -381,7 +372,8 @@ class EcovacsDevice {
     });
 
     this.vacbot.on('EmptyDustBin', (v: string) => {
-      if (v === 'start') { this.cleanState = OpState.EmptyingDustBin; this.applyState(); }
+      // Auto-empty at dock: robot stays in Charging/Docked — no state change needed
+      this.log.info(`[${this.name}] EmptyDustBin: ${v}`);
     });
 
     this.vacbot.on('StatusInfo', (v: unknown) => { this.log.debug(`[${this.name}] StatusInfo: ${JSON.stringify(v)}`); });
@@ -699,8 +691,8 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
         { operationalStateId: OpState.SeekingCharger },
         { operationalStateId: OpState.Charging },
         { operationalStateId: OpState.Docked },
-        { operationalStateId: OpState.CleaningMop },
-        { operationalStateId: OpState.EmptyingDustBin },
+        // CleaningMop (68) and EmptyingDustBin (67) are Matter 1.4 states not
+        // supported by Apple Home HomePod firmware — omitted to prevent "Aggiornamento".
       ],
       initialAreas, [], null, [],
     );
