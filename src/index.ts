@@ -166,6 +166,12 @@ class EcovacsDevice {
     this.sentAttrs.clear(); // force full re-sync: new endpoint starts with default values
     this.opState = -1;      // force applyState to re-send operationalState
     this.sentErrorId = -1;  // force re-send of active error (if any) to new endpoint
+    // Re-populate ServiceArea.supportedAreas from config after the clear, so that
+    // updateServiceAreas skips the redundant write when rooms arrive from the robot.
+    if (this.roomsConfig.length > 0) {
+      const areas = this.buildAreasFromConfig();
+      this.sentAttrs.set('ServiceArea.supportedAreas', JSON.stringify(areas));
+    }
     this.registerHandlers();
   }
 
@@ -654,6 +660,20 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
     const name = vac.nick || vac.deviceName || vac.did;
     this.log.info(`Registering: "${name}" (${vac.did})`);
 
+    // Build device first so buildAreasFromConfig() can populate matterIdToEcovacsId.
+    const device = new EcovacsDevice(api, vac, pollSec, this.log, roomsConfig);
+    if (roomsConfig.length === 0) {
+      device.onRoomsDiscovered = (disc: RoomConfig[]) => {
+        const updated = { ...this.config, rooms: disc } as EcovacsConfig;
+        this.saveConfig(updated as unknown as PlatformConfig);
+        this.wssSendSnackbarMessage(`✅ ${name}: ${disc.length} stanze scoperte — riavvia per applicare.`, 8000);
+      };
+    }
+
+    // Pre-build areas from config so the endpoint starts with the correct value.
+    // This avoids the [] → [N rooms] write that triggers Apple Home "Aggiornamento".
+    const initialAreas = device.buildAreasFromConfig();
+
     const endpoint = new RoboticVacuumCleaner(
       name, vac.did, 'server',
       RUN.IDLE,
@@ -681,26 +701,12 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
         { operationalStateId: OpState.CleaningMop },
         { operationalStateId: OpState.EmptyingDustBin },
       ],
-      [], [], null, [],
+      initialAreas, [], null, [],
     );
 
-    const device = new EcovacsDevice(api, vac, pollSec, this.log, roomsConfig);
-    if (roomsConfig.length === 0) {
-      device.onRoomsDiscovered = (disc: RoomConfig[]) => {
-        const updated = { ...this.config, rooms: disc } as EcovacsConfig;
-        this.saveConfig(updated as unknown as PlatformConfig);
-        this.wssSendSnackbarMessage(`✅ ${name}: ${disc.length} stanze scoperte — riavvia per applicare.`, 8000);
-      };
-    }
     device.bindEndpoint(endpoint);
     this.devices.push(device);
     await this.registerDevice(endpoint as unknown as MatterbridgeEndpoint);
-    // After registerDevice, pre-load supportedAreas from config so matter.js stores
-    // the correct value before Apple Home subscribes — avoids [] → [N rooms] write.
-    if (roomsConfig.length > 0) {
-      const initialAreas = device.buildAreasFromConfig();
-      await endpoint.setAttribute('ServiceArea', 'supportedAreas', initialAreas, this.log).catch(() => undefined);
-    }
     device.connect().catch((err: unknown) => this.log.error(`[${name}] Initial connect failed: ${String(err)}`));
   }
 }
