@@ -137,7 +137,27 @@ class EcovacsDevice {
     private readonly pollSec: number,
     private readonly log: AnsiLogger,
     private readonly roomsConfig: RoomConfig[] = [],
-  ) {}
+  ) {
+    // Pre-populate matterIdToEcovacsId and sentAttrs from roomsConfig so that
+    // when rooms arrive from the robot, updateServiceAreas produces the same JSON
+    // → sentAttrs blocks the write → no Apple Home "Aggiornamento" notification.
+    if (roomsConfig.length > 0) {
+      const areas = this.buildAreasFromConfig();
+      this.sentAttrs.set('ServiceArea.supportedAreas', JSON.stringify(areas));
+    }
+  }
+
+  // Build the supportedAreas array from roomsConfig in a stable, deterministic order.
+  // Used both for pre-populating sentAttrs and for initializing the endpoint.
+  buildAreasFromConfig(): any[] {
+    return this.roomsConfig
+      .filter(r => r.enabled !== false)
+      .map(r => {
+        const matterAreaId = (parseInt(r.id, 10) || 0) + 1;
+        this.matterIdToEcovacsId.set(matterAreaId, r.id);
+        return { areaId: matterAreaId, mapId: null, areaInfo: { locationInfo: { locationName: r.name?.trim() || r.id, floorNumber: 0, areaType: null }, landmarkInfo: null } };
+      });
+  }
 
   get name(): string { return this.vacuum.nick || this.vacuum.deviceName || this.vacuum.did; }
 
@@ -405,11 +425,15 @@ class EcovacsDevice {
       this.onRoomsDiscovered = undefined;
     }
 
-    let entries = Array.from(this.rooms.entries());
+    // When roomsConfig is available, iterate in roomsConfig order for a stable JSON
+    // that matches the pre-populated sentAttrs value → no redundant setAttribute.
+    let entries: [string, string][];
     if (this.roomsConfig.length > 0) {
-      entries = entries
-        .filter(([id]) => { const c = this.roomsConfig.find((r: RoomConfig) => r.id === id); return c ? c.enabled !== false : true; })
-        .map(([id, n]) => { const c = this.roomsConfig.find((r: RoomConfig) => r.id === id); return [id, (c?.name?.trim() || n)] as [string, string]; });
+      entries = this.roomsConfig
+        .filter(r => r.enabled !== false && this.rooms.has(r.id))
+        .map(r => [r.id, r.name?.trim() || this.rooms.get(r.id) || r.id] as [string, string]);
+    } else {
+      entries = Array.from(this.rooms.entries());
     }
 
     this.matterIdToEcovacsId.clear();
@@ -671,6 +695,12 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
     device.bindEndpoint(endpoint);
     this.devices.push(device);
     await this.registerDevice(endpoint as unknown as MatterbridgeEndpoint);
+    // After registerDevice, pre-load supportedAreas from config so matter.js stores
+    // the correct value before Apple Home subscribes — avoids [] → [N rooms] write.
+    if (roomsConfig.length > 0) {
+      const initialAreas = device.buildAreasFromConfig();
+      await endpoint.setAttribute('ServiceArea', 'supportedAreas', initialAreas, this.log).catch(() => undefined);
+    }
     device.connect().catch((err: unknown) => this.log.error(`[${name}] Initial connect failed: ${String(err)}`));
   }
 }
