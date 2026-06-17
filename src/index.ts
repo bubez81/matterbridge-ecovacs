@@ -138,10 +138,11 @@ class EcovacsDevice {
     private readonly log: AnsiLogger,
     private readonly roomsConfig: RoomConfig[] = [],
   ) {
-    // Pre-populate matterIdToEcovacsId and sentAttrs from roomsConfig so that
-    // when rooms arrive from the robot, updateServiceAreas produces the same JSON
-    // → sentAttrs blocks the write → no Apple Home "Aggiornamento" notification.
     if (roomsConfig.length > 0) {
+      // Rooms already in config: mark as loaded so GetMaps is skipped entirely.
+      // This prevents supportedAreas from ever changing after startup, eliminating
+      // the [] → [N rooms] write that causes Apple Home "Aggiornamento".
+      this.roomsLoaded = true;
       const areas = this.buildAreasFromConfig();
       this.sentAttrs.set('ServiceArea.supportedAreas', JSON.stringify(areas));
     }
@@ -182,10 +183,6 @@ class EcovacsDevice {
     const key = `${cluster}.${attr}`;
     const serialized = JSON.stringify(value);
     if (this.sentAttrs.get(key) === serialized) return;
-    if (key === 'ServiceArea.supportedAreas') {
-      const prev = this.sentAttrs.get(key);
-      this.log.warn(`[${this.name}] DBG supportedAreas sentAttrs=${prev === undefined ? 'EMPTY' : prev.substring(0, 80)} newJSON=${serialized.substring(0, 80)}`);
-    }
 
     if (slow) {
       this.pendingSlowAttrs.set(key, { cluster, attr, value, serialized });
@@ -195,8 +192,8 @@ class EcovacsDevice {
           const batch = [...this.pendingSlowAttrs.values()];
           this.pendingSlowAttrs.clear();
           for (const { cluster: c, attr: a, value: v, serialized: s } of batch) {
-            await this.endpoint?.setAttribute(c, a, v, this.log).catch(() => undefined);
-            this.sentAttrs.set(`${c}.${a}`, s);
+            this.sentAttrs.set(`${c}.${a}`, s); // set before await to block concurrent duplicates
+            await this.endpoint?.setAttribute(c, a, v, this.log).catch(() => this.sentAttrs.delete(`${c}.${a}`));
           }
         }, 1000);
       }
@@ -208,8 +205,8 @@ class EcovacsDevice {
           const batch = [...this.pendingAttrs.values()];
           this.pendingAttrs.clear();
           for (const { cluster: c, attr: a, value: v, serialized: s } of batch) {
-            await this.endpoint?.setAttribute(c, a, v, this.log).catch(() => undefined);
-            this.sentAttrs.set(`${c}.${a}`, s);
+            this.sentAttrs.set(`${c}.${a}`, s); // set before await to block concurrent duplicates
+            await this.endpoint?.setAttribute(c, a, v, this.log).catch(() => this.sentAttrs.delete(`${c}.${a}`));
           }
         }, 50);
       }
