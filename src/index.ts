@@ -956,7 +956,7 @@ class EcovacsDevice {
 
 class EcovacsPlatform extends MatterbridgeDynamicPlatform {
   private devices: EcovacsDevice[] = [];
-  private reauth: () => Promise<void> = async () => { throw new Error('not authenticated yet'); };
+  private reauth: (reason?: string) => Promise<void> = async () => { throw new Error('not authenticated yet'); };
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(matterbridge: PlatformMatterbridge, log: AnsiLogger, config: PlatformConfig) {
@@ -1028,7 +1028,7 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
       this.refreshTimer = setTimeout(async () => {
         this.refreshTimer = null;
         try {
-          await this.reauth();                    // re-login + saveToken() + scheduleRefresh()
+          await this.reauth('proactive refresh'); // re-login + saveToken() + scheduleRefresh()
           for (const d of this.devices) d.applyRefreshedToken(api.user_access_token);
         } catch (err) {
           this.log.error(`Proactive token refresh failed: ${String(err)} — retrying in ${TOKEN_REFRESH_RETRY_MS / 60_000} min`);
@@ -1080,10 +1080,11 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
 
     // Shared, single-flight re-authentication for devices whose MQTT token gets rejected.
     let reauthInFlight: Promise<void> | null = null;
-    this.reauth = () => {
+    this.reauth = (reason = 'token rejected') => {
       if (!reauthInFlight) {
         reauthInFlight = (async () => {
-          this.log.warn('Re-authenticating with Ecovacs (token rejected)…');
+          const msg = `Re-authenticating with Ecovacs (${reason})…`;
+          if (reason === 'token rejected') this.log.warn(msg); else this.log.info(msg);
           try { fs.unlinkSync(tokenFile); } catch { /* ignore */ }
           await authenticate();
           saveToken();
