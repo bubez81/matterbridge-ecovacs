@@ -1,5 +1,10 @@
 /**
- * matterbridge-ecovacs  v0.1.89
+ * matterbridge-ecovacs  v0.1.90
+ *
+ * 0.1.90: detect the mop pad being reattached. The T30 reports the number of attached mop pads
+ *   in WaterInfo.mopCount (observed 2026-10-04: 1 with a pad detached, 2 after reattaching),
+ *   pushed as soon as it changes. ecovacs-deebot ignores the field: we read it and clear the
+ *   mop-pad error as soon as the count goes up. (Evt 1007 is not sent by the T30.)
  *
  * 0.1.89: Evt codes known to ecovacs-deebot (library/eventCodes.json) are logged by name.
  *   Evt 1007 "Mop installed" clears the mop-pad error at once. Evt 1026 "Charging dock not
@@ -200,6 +205,8 @@ class EcovacsDevice {
   // True while the active error comes from an 'Evt' message (auto-clears after a timeout).
   private evtErrorActive = false;
   private evtErrorClear: 'timeout' | 'dock' = 'timeout';
+  // Number of attached mop pads from WaterInfo.mopCount (-1 = unknown).
+  private mopCount = -1;
   private evtErrorTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Re-authentication callback injected by the platform (same path as startup login).
@@ -451,6 +458,7 @@ class EcovacsDevice {
       return;
     }
     this.hookEvt();
+    this.hookWaterInfo();
     this.listenVacbotEvents();
     this.vacbot.connect();
     this.vacbot.on('ready', () => {
@@ -461,6 +469,7 @@ class EcovacsDevice {
         this.vacbot?.run('GetBatteryState');
         this.vacbot?.run('GetChargeState');
         this.vacbot?.run('GetCleanState_V2');
+        this.vacbot?.run('GetWaterInfo'); // baseline for mopCount (attached mop pads)
         if (!this.roomsLoaded) this.vacbot?.run('GetMaps');
         this.startPolling();
       }, 3000);
@@ -518,6 +527,36 @@ class EcovacsDevice {
     }
   }
 
+  /** ecovacs-deebot ignores WaterInfo.mopCount (attached mop pads): wrap its handler. */
+  private hookWaterInfo(): void {
+    try {
+      if (typeof this.vacbot?.handleWaterInfo !== 'function') return;
+      const orig = this.vacbot.handleWaterInfo.bind(this.vacbot);
+      this.vacbot.handleWaterInfo = (payload: any) => {
+        try { this.onMopCount(Number(payload?.mopCount)); }
+        catch (e) { this.log.warn(`[${this.name}] mopCount handling failed: ${String(e)}`); }
+        return orig(payload);
+      };
+    } catch (e) {
+      this.log.warn(`[${this.name}] Could not hook WaterInfo: ${String(e)}`);
+    }
+  }
+
+  private onMopCount(count: number): void {
+    if (!Number.isFinite(count) || count < 0) return;
+    const prev = this.mopCount;
+    this.mopCount = count;
+    if (prev === count) return;
+    this.log.info(`[${this.name}] Mop pads attached: ${count}${prev >= 0 ? ` (was ${prev})` : ''}`);
+    // Pad reattached: the count went up, or (no baseline yet) it reports a full set (2 pads).
+    const reattached = prev >= 0 ? count > prev : count >= 2;
+    if (reattached && this.evtErrorActive &&
+        this.currentErrorId === RvcOperationalState.ErrorState.MopCleaningPadMissing) {
+      this.log.info(`[${this.name}] Mop pad error cleared (pad reattached)`);
+      this.clearEvtError(true);
+    }
+  }
+
   private onEvt(code: number): void {
     const evtName = EVT_NAMES[String(code)];
     if (code === EVT_MOP_INSTALLED) {
@@ -535,6 +574,8 @@ class EcovacsDevice {
       return;
     }
     this.log.warn(`[${this.name}] Evt ${code}${evtName ? ` (${evtName})` : ''} → Matter error ${spec.errId}`);
+    if (spec.errId === RvcOperationalState.ErrorState.MopCleaningPadMissing)
+      this.vacbot?.run('GetWaterInfo'); // refresh mopCount baseline (pad detection)
     this.hasActiveError = true;
     this.evtErrorActive = true;
     this.evtErrorClear = spec.clear;

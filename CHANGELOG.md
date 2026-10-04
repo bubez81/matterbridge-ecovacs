@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.90 — 2026-10-04
+
+- Detect the mop pad being reattached: the T30 pushes `WaterInfo.mopCount` (attached mop pads; 1 with a pad detached, 2 after reattaching), which ecovacs-deebot ignores. When the count goes up, the mop-pad error clears immediately. A `GetWaterInfo` request establishes the baseline at connect and when the error fires.
+- Note: `Evt 1007` (Mop installed) is not sent by the T30; its handling is kept for other models.
+
 ## 0.1.89 — 2026-10-04
 
 - `Evt` codes known to ecovacs-deebot (`library/eventCodes.json`) are logged by name instead of "Unhandled".
