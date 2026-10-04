@@ -1,5 +1,27 @@
 /**
- * matterbridge-ecovacs  v0.1.80
+ * matterbridge-ecovacs  v0.1.88
+ *
+ * 0.1.88: recover from an invalidated token. MQTT "Not authorized" (token rejected by the broker
+ *   while REST still accepts it) now triggers a single-flight re-authentication through the same
+ *   path used at startup (device-auth identity), refreshes the token cache and reconnects.
+ *   Before, the MQTT client retried forever with the dead token (100 MB of log, robot unreachable).
+ *   Plain disconnects no longer re-login with email/password (that bypassed device-auth).
+ *   ErrorCode -1 (client/connection failure, not a robot error) is no longer surfaced.
+ *
+ * 0.1.87: while an error is active, operationalState = Error (Matterbridge wipes operationalError
+ *   when the state leaves Error, so errors never reached Apple Home). Real cleaning (CleanReport
+ *   Running) clears any error; a new Start clears a transient Evt error.
+ *
+ * 0.1.86: handle 'Evt' messages (unhandled by ecovacs-deebot). Evt 1128 = mop pad missing/detached:
+ *   robot refuses to start → report MopCleaningPadMissing, drop the optimistic Running state.
+ *   The error auto-clears after EVT_ERROR_CLEAR_MS (like the Ecovacs app), or earlier on a
+ *   real cleaning start (CleanReport → Running) or ErrorCode 0/100. Other Evt codes are logged.
+ *   Fix: ErrorCode arrives as a string — normalized to number ("0" was treated as a real error).
+ *
+ * 0.1.81–0.1.85: verified device identity (ecovacs-device-auth.json) to pass Ecovacs device
+ *   verification (error 1013); token cache bound to deviceId and chmod 600; extended error map;
+ *   hasActiveError / hasStartedCleaning guards; force-write Docked after registration.
+ *
  * Complete rewrite following matterbridge-roomba / matterbridge-aeg-robot patterns.
  *
  * Key design principles:
@@ -7,7 +29,15 @@
  *  - lastPushed dedup: our own layer on top, prevents redundant calls before they reach matter.js
  *  - 100 ms coalescing timer for operationalState (absorbs rapid transitions during stop/dock)
  *  - 1000 ms slow queue for ServiceArea.supportedAreas (rooms arrive over ~800 ms)
- *  - operationCompletion event triggered when cleaning ends (Apple Home state refresh)
+ *  - operationCompletion fires only when robot actually cleaned (hasStartedCleaning guard):
+ *      wasActiveCleaning stays true through SeekingCharger (robot is still returning),
+ *      only cleared on Charging|Docked|Stopped|Error
+ *  - hasActiveError flag: error persists until ErrorCode 0/100 explicitly clears it.
+ *    Without this, CleanReport: undefined (polling) resets cleanState → error clears 215ms
+ *    after it fired, before Apple Home can show it.
+ *  - Force-write Docked after registerDevice to clear stale persisted state from old versions
+ *    (CleaningMop=68 was written by <0.1.79; now evicted on every restart so Apple Home
+ *    never sees an unknown state in the initial subscription report)
  *  - NO CleaningMop (68) or EmptyingDustBin (67): Matter 1.4 states not supported by
  *    Apple Home HomePod firmware; map mop-wash/dry and auto-empty to chargeState instead
  *  - sentErrorId sentinel: never write operationalError at startup (avoids spurious notification
@@ -37,6 +67,13 @@ export default function initializePlugin(matterbridge: PlatformMatterbridge, log
 const RUN   = { IDLE: 1, CLEANING: 2 } as const;
 const CLEAN = { VACUUM: 1, MOP: 2, VACUUM_AND_MOP: 3, VACUUM_THEN_MOP: 4 } as const;
 const OpState = RvcOperationalState.OperationalState;
+// 'Evt' codes (sent by 950-type robots, ignored by ecovacs-deebot) that map to a Matter error.
+// 1128 observed on T30 Omni 2026-10-04: mop pad detached, robot refuses to start (even vacuum-only).
+const EVT_ERRORS: Record<number, number> = {
+  1128: RvcOperationalState.ErrorState.MopCleaningPadMissing,
+};
+// Evt-based errors are transient (the Ecovacs app clears them too): auto-clear after this delay.
+const EVT_ERROR_CLEAR_MS = 60_000;
 const RECONNECT_DELAYS = [5_000, 15_000, 30_000, 60_000, 120_000];
 
 // ── State-mapping helpers ──────────────────────────────────────────────────────
@@ -76,19 +113,28 @@ function ecovacsErrorToMatterError(code: number): number {
   const E = RvcOperationalState.ErrorState;
   switch (code) {
     case 0: case 100: return E.NoError;
+    // Robot errors
     case 101:         return E.LowBattery;
-    case 103:         return E.NavigationSensorObscured;
-    case 104:         return E.NavigationSensorObscured;
-    case 105:         return E.Stuck;
+    case 102:         return E.FailedToFindChargingDock;
+    case 103: case 104: return E.NavigationSensorObscured;
+    case 105: case 106: case 113: return E.Stuck;
     case 108: case 109: return E.BrushJammed;
     case 110:         return E.DustBinMissing;
+    case 111:         return E.DustBinFull;
     case 114:         return E.DustBinFull;
-    case 120: case 125: case 126: return E.WaterTankMissing;
+    case 118:         return E.WaterTankEmpty;
+    case 119:         return E.WaterTankLidOpen;
+    case 120: case 121: case 125: case 126: return E.WaterTankMissing;
     case 128: case 129: return E.MopCleaningPadMissing;
+    // Auto-empty station errors (T10 TURBO / OMNI)
+    case 312:         return E.DustBinFull;    // station bag full
+    case 313:         return E.DustBinMissing; // station bag missing
+    // Water / dirty water (station or robot)
+    case 75:          return E.DirtyWaterTankMissing;
     case 301:         return E.WaterTankEmpty;
     case 302: case 305: return E.DirtyWaterTankFull;
     case 303:         return E.WaterTankMissing;
-    case 304: case 75: return E.DirtyWaterTankMissing;
+    case 304:         return E.DirtyWaterTankMissing;
     default:          return E.UnableToCompleteOperation;
   }
 }
@@ -101,6 +147,8 @@ function isActiveCleaning(s: number): boolean {
 
 interface EcovacsVacuumInfo { did: string; nick: string; deviceName: string; resource?: string; class?: string; }
 interface RoomConfig { id: string; name?: string; enabled?: boolean; }
+/** Verified device identity saved in ~/.matterbridge/ecovacs-device-auth.json */
+interface DeviceAuth { email: string; deviceId: string; uid: string; accessToken: string; }
 interface EcovacsConfig extends PlatformConfig {
   email: string; password: string; countryCode: string;
   authDomain?: string; whiteList?: string[];
@@ -126,6 +174,21 @@ class EcovacsDevice {
   // notification (internal struct normalization differs from cluster default).
   private sentErrorId: number = -1;
 
+  // True while a real ErrorCode (>0) is active. Cleared only by ErrorCode 0/100.
+  // Without this, CleanReport: undefined (polling, ~200ms after error) resets
+  // cleanState → Stopped → applyError sees no error → clears it before Apple Home sees it.
+  private hasActiveError = false;
+
+  // True while the active error comes from an 'Evt' message (auto-clears after a timeout).
+  private evtErrorActive = false;
+  private evtErrorTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Re-authentication callback injected by the platform (same path as startup login).
+  reauth: (() => Promise<void>) | null = null;
+  private authRecovering = false;
+  private authRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private authAttempt = 0;
+
   // lastPushed: track the last value we actually sent to matter.js for each attribute.
   // updateAttribute() has its own deepEqual guard but we add this layer so we never
   // even call updateAttribute() with a value we've already sent — matches matterbridge-roomba.
@@ -147,9 +210,16 @@ class EcovacsDevice {
   private pendingAreas: any[] | null = null;
   private areasTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Tracks whether the last sent opState was "active" (Running/Paused/SeekingCharger)
-  // Used to trigger operationCompletion when cleaning ends (Apple Home refresh)
+  // Tracks whether the last sent opState was Running or Paused.
+  // SeekingCharger is intentionally excluded: the robot may send ChargeState: returning
+  // at startup (before we ever cleaned), which would set this flag and cause
+  // operationCompletion to fire spuriously when 'charging' arrives → "Avviso" in Apple Home.
   private wasActiveCleaning = false;
+
+  // Set true when CleanReport fires with Running, reset when operationCompletion fires.
+  // Guards operationCompletion: prevents it from firing at startup or on state transitions
+  // that did not involve an actual cleaning cycle in this session.
+  private hasStartedCleaning = false;
 
   // Room discovery
   private rooms: Map<string, string> = new Map();
@@ -213,7 +283,10 @@ class EcovacsDevice {
     this.lastPushed = { opState: -1, batPct: -1, batCharge: -1, runMode: -1 };
     this.lastPushedAreas = '';
     this.sentErrorId = -1;
+    this.hasActiveError = false;
+    this.clearEvtError(false);
     this.wasActiveCleaning = false;
+    this.hasStartedCleaning = false;
     // Re-populate areas cache from config after reset so first updateServiceAreas finds no delta
     if (this.roomsConfig.length > 0) {
       const areas = this.buildAreasFromConfig();
@@ -239,16 +312,24 @@ class EcovacsDevice {
       this.pendingOpState = null;
       if (val === this.lastPushed.opState) return;
       const prevWasActive = this.wasActiveCleaning;
-      const nowActive = val === OpState.Running || val === OpState.Paused || val === OpState.SeekingCharger;
+      const nowActive = val === OpState.Running || val === OpState.Paused;
+      const nowDone = val === OpState.Charging || val === OpState.Docked;
       this.lastPushed.opState = val;
-      this.wasActiveCleaning = nowActive;
+      // wasActiveCleaning: set true on Running/Paused; keep true on SeekingCharger
+      // (robot is returning from cleaning, still "was active"); clear only on final states.
+      // SeekingCharger at startup (before any cleaning) won't set it because it starts false
+      // and we only SET it on Running/Paused, never on SeekingCharger alone.
+      if (nowActive) this.wasActiveCleaning = true;
+      else if (nowDone || val === OpState.Stopped || val === OpState.Error) this.wasActiveCleaning = false;
       const label = (RvcOperationalState.OperationalState as Record<number, string>)[val] ?? String(val);
       this.log.info(`[${this.name}] opState → ${label}`);
       await this.endpoint?.updateAttribute('RvcOperationalState', 'operationalState', val, this.log);
-      // Trigger operationCompletion when transitioning from active cleaning to idle/charging.
-      // This forces Apple Home to refresh device state, clearing any "Aggiornamento" caused
-      // by the rapid subscription notifications during the cleaning cycle.
-      if (prevWasActive && !nowActive) {
+      // Trigger operationCompletion only when:
+      //  - we were actively cleaning (Running or Paused) in this session, AND
+      //  - robot has reached a final resting state (Charging or Docked), AND
+      //  - hasStartedCleaning is set (guards against startup false-positives)
+      if (prevWasActive && nowDone && this.hasStartedCleaning) {
+        this.hasStartedCleaning = false;
         this.log.info(`[${this.name}] operationCompletion`);
         await this.endpoint?.triggerEvent('RvcOperationalState', 'operationCompletion', {
           completionErrorCode: 0,
@@ -261,7 +342,10 @@ class EcovacsDevice {
 
   /** Write operationalError only when strictly necessary (never at startup with NoError). */
   private applyError(): void {
-    const errId = this.cleanState === OpState.Error
+    // Use hasActiveError (set/cleared by ErrorCode events) rather than cleanState===Error.
+    // CleanReport: undefined arrives ~200ms after an error and would reset cleanState to
+    // Stopped, clearing the error from Apple Home before the user sees it.
+    const errId = this.hasActiveError
       ? this.currentErrorId
       : RvcOperationalState.ErrorState.NoError;
 
@@ -323,9 +407,15 @@ class EcovacsDevice {
    * they are Matter 1.4 values that Apple Home HomePod doesn't recognize.
    */
   private applyState(): void {
-    const resolved = (isActiveCleaning(this.cleanState) || this.cleanState === OpState.SeekingCharger)
-      ? this.cleanState
-      : this.chargeState;
+    // While an error is active, operationalState MUST be Error: Matterbridge's RVC server
+    // switches the state to Error when operationalError is set, and resets operationalError
+    // to NoError as soon as the state leaves Error. Writing Charging/Docked right after the
+    // error (as <=0.1.86 did) silently wiped it ~100 ms later — Apple Home never showed it.
+    const resolved = this.hasActiveError
+      ? OpState.Error
+      : (isActiveCleaning(this.cleanState) || this.cleanState === OpState.SeekingCharger)
+        ? this.cleanState
+        : this.chargeState;
     this.applyError();
     this.scheduleOpState(resolved);
   }
@@ -341,6 +431,7 @@ class EcovacsDevice {
       this.scheduleReconnect();
       return;
     }
+    this.hookEvt();
     this.listenVacbotEvents();
     this.vacbot.connect();
     this.vacbot.on('ready', () => {
@@ -356,6 +447,13 @@ class EcovacsDevice {
       }, 3000);
     });
     this.vacbot.on('Error', (msg: string) => {
+      if (typeof msg === 'string' && msg.includes('Not authorized')) {
+        // Token rejected by the MQTT broker: log once, then recover (no flood).
+        if (!this.authRecovering)
+          this.log.warn(`[${this.name}] MQTT not authorized — token invalid, re-authenticating`);
+        this.handleAuthFailure();
+        return;
+      }
       this.log.warn(`[${this.name}] Vacbot error: ${msg}`);
       if (!msg || msg.includes('not reachable') || msg.includes('IndexSizeError') ||
           msg.includes('NoError') || msg.includes('source width is 0')) return;
@@ -363,6 +461,7 @@ class EcovacsDevice {
       this.applyState();
     });
     this.vacbot.on('disconnect', () => {
+      if (this.authRecovering) return; // closed on purpose; handleAuthFailure reconnects
       this.log.warn(`[${this.name}] Disconnected`);
       this.stopPolling();
       this.scheduleReconnect();
@@ -372,10 +471,96 @@ class EcovacsDevice {
   async disconnect(): Promise<void> {
     this.shuttingDown = true;
     this.stopPolling();
+    if (this.evtErrorTimer)  { clearTimeout(this.evtErrorTimer);  this.evtErrorTimer = null; }
+    if (this.authRetryTimer) { clearTimeout(this.authRetryTimer); this.authRetryTimer = null; }
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     if (this.opStateTimer)   { clearTimeout(this.opStateTimer);   this.opStateTimer = null; }
     if (this.areasTimer)     { clearTimeout(this.areasTimer);      this.areasTimer = null; }
     try { if (this.vacbot) await this.vacbot.disconnectAsync(); } catch { /* ignore */ }
+  }
+
+  // ── Evt messages ─────────────────────────────────────────────────────────────
+
+  /** ecovacs-deebot marks 'Evt' as unhandled and emits nothing: wrap its handler. */
+  private hookEvt(): void {
+    try {
+      if (typeof this.vacbot?.handleEvt !== 'function') {
+        this.log.warn(`[${this.name}] handleEvt not found — Evt messages will be ignored`);
+        return;
+      }
+      const orig = this.vacbot.handleEvt.bind(this.vacbot);
+      this.vacbot.handleEvt = (payload: any) => {
+        try { this.onEvt(Number(payload?.code)); }
+        catch (e) { this.log.warn(`[${this.name}] Evt handling failed: ${String(e)}`); }
+        return orig(payload);
+      };
+    } catch (e) {
+      this.log.warn(`[${this.name}] Could not hook Evt: ${String(e)}`);
+    }
+  }
+
+  private onEvt(code: number): void {
+    const errId = EVT_ERRORS[code];
+    if (errId === undefined) {
+      this.log.warn(`[${this.name}] Unhandled Evt code: ${code}`);
+      return;
+    }
+    this.log.warn(`[${this.name}] Evt ${code} → Matter error ${errId}`);
+    this.hasActiveError = true;
+    this.evtErrorActive = true;
+    this.currentErrorId = errId;
+    // The robot refused to start: drop the optimistic Running set by the Start command.
+    if (isActiveCleaning(this.cleanState)) this.cleanState = OpState.Stopped;
+    this.writeRunMode(RUN.IDLE);
+    this.applyState();
+    if (this.evtErrorTimer) clearTimeout(this.evtErrorTimer);
+    this.evtErrorTimer = setTimeout(() => {
+      this.evtErrorTimer = null;
+      if (this.evtErrorActive) {
+        this.log.info(`[${this.name}] Evt error auto-cleared after ${EVT_ERROR_CLEAR_MS / 1000}s`);
+        this.clearEvtError(true);
+      }
+    }, EVT_ERROR_CLEAR_MS);
+  }
+
+  /** Clear an Evt-originated error (no-op if the active error came from ErrorCode). */
+  private clearEvtError(apply: boolean): void {
+    if (this.evtErrorTimer) { clearTimeout(this.evtErrorTimer); this.evtErrorTimer = null; }
+    if (!this.evtErrorActive) return;
+    this.evtErrorActive = false;
+    this.hasActiveError = false;
+    this.currentErrorId = RvcOperationalState.ErrorState.NoError;
+    if (apply) this.applyState();
+  }
+
+  // ── Auth recovery ────────────────────────────────────────────────────────────
+
+  /** Single-flight recovery from an invalid token: close MQTT, re-login, reconnect. */
+  private async handleAuthFailure(): Promise<void> {
+    if (this.authRecovering || this.shuttingDown) return;
+    this.authRecovering = true;
+    this.stopPolling();
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    // Stop the MQTT client's own retry loop with the dead token.
+    try { if (this.vacbot) await this.vacbot.disconnectAsync(); } catch { /* ignore */ }
+    try {
+      if (!this.reauth) throw new Error('no reauth callback');
+      await this.reauth();
+      this.log.info(`[${this.name}] Re-authenticated — reconnecting`);
+      this.authAttempt = 0;
+      this.reconnectAttempt = 0;
+      this.authRecovering = false;
+      await this.connect();
+    } catch (err) {
+      const delay = RECONNECT_DELAYS[Math.min(this.authAttempt, RECONNECT_DELAYS.length - 1)];
+      this.authAttempt++;
+      this.log.error(`[${this.name}] Re-authentication failed (attempt ${this.authAttempt}): ${String(err)} — retrying in ${delay / 1000}s`);
+      this.authRetryTimer = setTimeout(() => {
+        this.authRetryTimer = null;
+        this.authRecovering = false;
+        this.handleAuthFailure();
+      }, delay);
+    }
   }
 
   private scheduleReconnect(): void {
@@ -384,7 +569,9 @@ class EcovacsDevice {
     this.reconnectAttempt++;
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      try { await this.api.connect(this.api.accountId, this.api.passwordHash); } catch { /* carry on */ }
+      // No re-login here: a network drop does not invalidate the token, and the old
+      // api.connect(account, passwordHash) bypassed the device-auth identity.
+      // If the token is really dead, MQTT reports "Not authorized" → handleAuthFailure().
       await this.connect();
     }, delay);
   }
@@ -397,6 +584,16 @@ class EcovacsDevice {
       this.log.info(`[${this.name}] CleanReport: ${v}`);
       const s = cleanReportToOpState(v);
       this.cleanState = s;
+      // Mark that actual cleaning happened in this session so operationCompletion
+      // fires when the robot docks — but only if it really cleaned.
+      if (s === OpState.Running) {
+        this.hasStartedCleaning = true;
+        // Robot really cleaning: any previous error (Evt or ErrorCode) is resolved.
+        // Errors are now visible in Apple Home, so they must not outlive the problem.
+        this.clearEvtError(false);
+        this.hasActiveError = false;
+        this.currentErrorId = RvcOperationalState.ErrorState.NoError;
+      }
       this.applyState();
       this.writeRunMode(isActiveCleaning(s) ? RUN.CLEANING : RUN.IDLE);
     });
@@ -429,19 +626,30 @@ class EcovacsDevice {
       }
     });
 
-    this.vacbot.on('ErrorCode', (code: number) => {
+    this.vacbot.on('ErrorCode', (rawCode: string | number) => {
+      // ecovacs-deebot emits the code as a string ("0"): normalize, or 0/100 never match.
+      const code = Number(rawCode);
+      // -1 is emitted by ecovacs-deebot for client/connection failures (e.g. MQTT not
+      // authorized), not by the robot: never surface it as a robot error in Apple Home.
+      if (code === -1 || Number.isNaN(code)) return;
       this.log.warn(`[${this.name}] ErrorCode: ${code}`);
       if (code === 0 || code === 100) {
+        this.clearEvtError(false);
+        this.hasActiveError = false;
         this.currentErrorId = RvcOperationalState.ErrorState.NoError;
         this.applyState();
         return;
       }
+      this.clearEvtError(false);
+      this.hasActiveError = true;
       this.currentErrorId = ecovacsErrorToMatterError(code);
       this.cleanState = OpState.Error;
       this.applyState();
     });
 
     this.vacbot.on('Error', (description: string) => {
+      if (typeof description === 'string' && description.includes('Not authorized'))
+        return; // handled (once) by the auth-recovery handler in connect()
       this.log.warn(`[${this.name}] Robot error: ${description}`);
     });
 
@@ -601,6 +809,8 @@ class EcovacsDevice {
 
   private async cmdStart(): Promise<void> {
     this.log.info(`[${this.name}] Start — cleanMode=${this.cleanMode} areas=${JSON.stringify(this.selectedAreaIds)} totalRooms=${this.matterIdToEcovacsId.size}`);
+    // New attempt: drop a transient Evt error (if the cause persists, the robot re-sends it).
+    this.clearEvtError(false);
     const workMode = this.cleanMode === CLEAN.VACUUM ? 1
       : this.cleanMode === CLEAN.MOP ? 2
       : this.cleanMode === CLEAN.VACUUM_THEN_MOP ? 3 : 0;
@@ -642,6 +852,7 @@ class EcovacsDevice {
 
 class EcovacsPlatform extends MatterbridgeDynamicPlatform {
   private devices: EcovacsDevice[] = [];
+  private reauth: () => Promise<void> = async () => { throw new Error('not authenticated yet'); };
 
   constructor(matterbridge: PlatformMatterbridge, log: AnsiLogger, config: PlatformConfig) {
     super(matterbridge, log, config);
@@ -653,8 +864,19 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
     const cfg = this.config as EcovacsConfig;
     this.log.info(`Authenticating: ${cfg.email} [${cfg.countryCode}]`);
 
+    // Verified device identity (passes Ecovacs device verification, error 1013).
+    const authFile = path.join(process.env.HOME ?? '', '.matterbridge', 'ecovacs-device-auth.json');
+    let deviceAuth: DeviceAuth | null = null;
+    try {
+      const saved = JSON.parse(fs.readFileSync(authFile, 'utf8'));
+      if (saved.email === cfg.email && saved.deviceId && saved.uid && saved.accessToken) {
+        deviceAuth = saved;
+        this.log.info(`Using verified Ecovacs device identity for ${cfg.email}`);
+      }
+    } catch { /* no verified device identity yet */ }
+
     const machineIdRaw = await nodeMachineId.machineId();
-    const machineId = machineIdRaw.substring(0, 32); // server requires 32-char (MD5) device ID
+    const deviceId: string = deviceAuth?.deviceId ?? machineIdRaw.substring(0, 32); // server requires 32-char (MD5) device ID
 
     // Patch appVersion in ecovacs-deebot to match current Ecovacs API requirements
     try {
@@ -669,14 +891,15 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
       this.log.warn(`Could not patch ecovacs-deebot: ${String(e)}`);
     }
 
-    const api = new EcoVacsAPI(machineId, cfg.countryCode, cfg.authDomain ?? '');
+    const api = new EcoVacsAPI(deviceId, cfg.countryCode, cfg.authDomain ?? '');
 
     // Token cache: avoid re-authenticating on every restart (prevents rate limiting)
     const tokenFile = path.join(process.env.HOME ?? '', '.matterbridge', 'ecovacs-token.json');
     let tokenLoaded = false;
     try {
       const cached = JSON.parse(fs.readFileSync(tokenFile, 'utf8'));
-      if (cached?.uid && cached?.user_access_token && cached?.authCode && cached?.email === cfg.email) {
+      if (cached?.uid && cached?.user_access_token && cached?.authCode &&
+          cached?.email === cfg.email && cached?.deviceId === deviceId) {
         api.uid = cached.uid;
         api.user_access_token = cached.user_access_token;
         api.authCode = cached.authCode;
@@ -691,10 +914,27 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
         fs.writeFileSync(tokenFile, JSON.stringify({
           uid: api.uid, user_access_token: api.user_access_token,
           authCode: api.authCode, resource: api.resource,
-          email: cfg.email, savedAt: new Date().toISOString(),
+          email: cfg.email, deviceId, savedAt: new Date().toISOString(),
         }), 'utf8');
+        fs.chmodSync(tokenFile, 0o600);
         this.log.info('Auth token cached');
       } catch { /* ignore */ }
+    };
+
+    const authenticate = async (): Promise<void> => {
+      if (!deviceAuth) {
+        await api.connect(cfg.email, EcoVacsAPI.md5(cfg.password));
+        return;
+      }
+      api.uid = deviceAuth.uid;
+      const authResult = await api.callUserAuthApi('user/getAuthCode', {
+        uid: deviceAuth.uid,
+        accessToken: deviceAuth.accessToken,
+      });
+      api.authCode = authResult.authCode;
+      const portalResult = await api.callUserApiLoginByItToken();
+      api.user_access_token = portalResult.token;
+      api.uid = portalResult.userId;
     };
 
     if (!tokenLoaded) {
@@ -702,7 +942,7 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
       let lastErr: unknown;
       for (let attempt = 1; attempt <= 5; attempt++) {
         try {
-          await api.connect(cfg.email, EcoVacsAPI.md5(cfg.password));
+          await authenticate();
           lastErr = null;
           break;
         } catch (err) {
@@ -716,14 +956,27 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
       saveToken();
     }
 
+    // Shared, single-flight re-authentication for devices whose MQTT token gets rejected.
+    let reauthInFlight: Promise<void> | null = null;
+    this.reauth = () => {
+      if (!reauthInFlight) {
+        reauthInFlight = (async () => {
+          this.log.warn('Re-authenticating with Ecovacs (token rejected)…');
+          try { fs.unlinkSync(tokenFile); } catch { /* ignore */ }
+          await authenticate();
+          saveToken();
+        })().finally(() => { reauthInFlight = null; });
+      }
+      return reauthInFlight;
+    };
+
     let devices: EcovacsVacuumInfo[];
     try {
       devices = await api.devices();
     } catch (err) {
       if (!tokenLoaded) throw err;
       this.log.warn(`Cached token expired — re-authenticating…`);
-      try { fs.unlinkSync(tokenFile); } catch { /* ignore */ }
-      await api.connect(cfg.email, EcoVacsAPI.md5(cfg.password));
+      await authenticate();
       saveToken();
       devices = await api.devices();
     }
@@ -750,6 +1003,7 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
     this.log.info(`Registering: "${name}" (${vac.did})`);
 
     const device = new EcovacsDevice(api, vac, pollSec, this.log, roomsConfig);
+    device.reauth = () => this.reauth();
 
     if (roomsConfig.length === 0) {
       device.onRoomsDiscovered = (disc: RoomConfig[]) => {
@@ -799,6 +1053,12 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
     device.bindEndpoint(endpoint);
     this.devices.push(device);
     await this.registerDevice(endpoint as unknown as MatterbridgeEndpoint);
+    // Force-write Docked immediately after the endpoint becomes active. This evicts any
+    // stale operationalState persisted from old plugin versions (CleaningMop=68 from <0.1.79).
+    // matter.js compares against its in-memory value: if persisted≠66 a subscription
+    // notification is sent so Apple Home never sees an unknown state in the initial report.
+    // setAttribute bypasses matterbridge's own deepEqual guard and always calls setStateOf.
+    await endpoint.setAttribute('RvcOperationalState', 'operationalState', OpState.Docked, this.log);
     device.connect().catch((err: unknown) => this.log.error(`[${name}] connect failed: ${String(err)}`));
   }
 }

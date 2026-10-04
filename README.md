@@ -153,7 +153,10 @@ Developed and tested on **Deebot T30 Omni**. Should work with all 950-type proto
 
 ## Technical notes
 
-- Authentication tokens are cached in `~/.matterbridge/ecovacs-token.json` to avoid rate limiting. Tokens are refreshed automatically when they expire (every ~7 days).
+- Authentication tokens are cached in `~/.matterbridge/ecovacs-token.json` (mode 600) to avoid rate limiting. If the MQTT broker rejects the token ("Not authorized"), the plugin re-authenticates once, refreshes the cache and reconnects automatically.
+- If Ecovacs requires device verification (error 1013), a verified device identity can be stored in `~/.matterbridge/ecovacs-device-auth.json` (`email`, `deviceId`, `uid`, `accessToken`); the plugin then logs in with that identity instead of email/password.
+- Robot errors are shown in Apple Home: while an error is active the vacuum reports the Matter `Error` state together with the error type.
+- Some warnings are sent by the robot as `Evt` messages, which `ecovacs-deebot` does not decode. Known codes are mapped (e.g. `1128` = mop pad missing → "Insert the mop pad"); these transient errors clear after 60 s, on the next start or when cleaning begins. Unknown codes are logged as `Unhandled Evt code: N` — please open an issue with the code and what the Ecovacs app showed.
 - The plugin auto-patches the `ecovacs-deebot` library at startup to ensure compatibility with the current Ecovacs API.
 
 ## License
