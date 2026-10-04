@@ -1,5 +1,14 @@
 /**
- * matterbridge-ecovacs  v0.1.90
+ * matterbridge-ecovacs  v0.2.0
+ *
+ * 0.2.0: ecovacs-deebot 1.0.0-alpha.23 (pure MQTT/JSON rewrite, Node >= 22.15, no canvas/XMPP deps).
+ *   - Proactive token refresh: the login reports the token validity (~7 days); the plugin
+ *     re-authenticates before expiry and hands the new token to the live MQTT session
+ *     (updateUserAccessToken), so the robot never becomes unreachable. The "Not authorized"
+ *     recovery of 0.1.88 stays as a safety net.
+ *   - Device-auth login goes through the library's completeLogin() (tracks the expiry).
+ *   - appVersion patch removed (the 1.0 library handles the current API itself).
+ *   - ErrorCode 0/100 ("no error") logged at info level instead of warn.
  *
  * 0.1.90: detect the mop pad being reattached. The T30 reports the number of attached mop pads
  *   in WaterInfo.mopCount (observed 2026-10-04: 1 with a pad detached, 2 after reattaching),
@@ -91,6 +100,10 @@ const EVT_ERRORS: Record<number, EvtErrorSpec> = {
 // 1007 "Mop installed": resolves a pending mop-pad error immediately.
 const EVT_MOP_INSTALLED = 1007;
 const EVT_ERROR_CLEAR_MS = 60_000;
+// Proactive token refresh: renew this long before the expiry reported by the library.
+const TOKEN_REFRESH_MARGIN_MS = 60 * 60_000;      // 1 h
+const TOKEN_REFRESH_RETRY_MS  = 10 * 60_000;      // retry after a failed refresh
+const TOKEN_DEFAULT_VALIDITY_MS = 7 * 24 * 3_600_000 * 0.99; // when the cache has no expiry
 
 // Human-readable names for Evt codes, from the library's own table (absent in some versions).
 let EVT_NAMES: Record<string, string> = {};
@@ -608,6 +621,18 @@ class EcovacsDevice {
 
   // ── Auth recovery ────────────────────────────────────────────────────────────
 
+  /** Hand a proactively refreshed token to the live MQTT session (no full reconnect). */
+  applyRefreshedToken(token: string): void {
+    if (this.shuttingDown || !this.vacbot) return;
+    if (typeof this.vacbot.updateUserAccessToken === 'function') {
+      this.log.info(`[${this.name}] Applying refreshed token to the MQTT session`);
+      this.vacbot.updateUserAccessToken(token);
+    } else {
+      // Older library: reconnect so the new token is used.
+      this.handleAuthFailure();
+    }
+  }
+
   /** Single-flight recovery from an invalid token: close MQTT, re-login, reconnect. */
   private async handleAuthFailure(): Promise<void> {
     if (this.authRecovering || this.shuttingDown) return;
@@ -710,14 +735,15 @@ class EcovacsDevice {
       // -1 is emitted by ecovacs-deebot for client/connection failures (e.g. MQTT not
       // authorized), not by the robot: never surface it as a robot error in Apple Home.
       if (code === -1 || Number.isNaN(code)) return;
-      this.log.warn(`[${this.name}] ErrorCode: ${code}`);
       if (code === 0 || code === 100) {
+        this.log.info(`[${this.name}] ErrorCode: ${code} (no error)`);
         this.clearEvtError(false);
         this.hasActiveError = false;
         this.currentErrorId = RvcOperationalState.ErrorState.NoError;
         this.applyState();
         return;
       }
+      this.log.warn(`[${this.name}] ErrorCode: ${code}`);
       this.clearEvtError(false);
       this.hasActiveError = true;
       this.currentErrorId = ecovacsErrorToMatterError(code);
@@ -931,6 +957,7 @@ class EcovacsDevice {
 class EcovacsPlatform extends MatterbridgeDynamicPlatform {
   private devices: EcovacsDevice[] = [];
   private reauth: () => Promise<void> = async () => { throw new Error('not authenticated yet'); };
+  private refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(matterbridge: PlatformMatterbridge, log: AnsiLogger, config: PlatformConfig) {
     super(matterbridge, log, config);
@@ -956,20 +983,9 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
     const machineIdRaw = await nodeMachineId.machineId();
     const deviceId: string = deviceAuth?.deviceId ?? machineIdRaw.substring(0, 32); // server requires 32-char (MD5) device ID
 
-    // Patch appVersion in ecovacs-deebot to match current Ecovacs API requirements
-    try {
-      const ecovacsPath = require.resolve('ecovacs-deebot');
-      let src = fs.readFileSync(ecovacsPath, 'utf8');
-      if (src.includes("appVersion = '2.2.3'")) {
-        src = src.replace("appVersion = '2.2.3'", "appVersion = '1.6.3'");
-        fs.writeFileSync(ecovacsPath, src, 'utf8');
-        this.log.info('Patched ecovacs-deebot appVersion to 1.6.3');
-      }
-    } catch (e) {
-      this.log.warn(`Could not patch ecovacs-deebot: ${String(e)}`);
-    }
-
-    const api = new EcoVacsAPI(deviceId, cfg.countryCode, cfg.authDomain ?? '');
+    this.log.info(`ecovacs-deebot ${String(EcoVacsAPI.version?.() ?? 'unknown')}`);
+    // 1.0 signature: (deviceId, country, continent = '', authDomain = '')
+    const api = new EcoVacsAPI(deviceId, cfg.countryCode, '', cfg.authDomain ?? '');
 
     // Token cache: avoid re-authenticating on every restart (prevents rate limiting)
     const tokenFile = path.join(process.env.HOME ?? '', '.matterbridge', 'ecovacs-token.json');
@@ -982,6 +998,8 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
         api.user_access_token = cached.user_access_token;
         api.authCode = cached.authCode;
         api.resource = cached.resource;
+        api.tokenExpiresAt = Number(cached.expiresAt) ||
+          (Date.parse(cached.savedAt) + TOKEN_DEFAULT_VALIDITY_MS) || null;
         this.log.info(`Using cached auth token for ${cfg.email} (saved ${cached.savedAt})`);
         tokenLoaded = true;
       }
@@ -993,10 +1011,31 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
           uid: api.uid, user_access_token: api.user_access_token,
           authCode: api.authCode, resource: api.resource,
           email: cfg.email, deviceId, savedAt: new Date().toISOString(),
+          expiresAt: api.tokenExpiresAt ?? null,
         }), 'utf8');
         fs.chmodSync(tokenFile, 0o600);
         this.log.info('Auth token cached');
       } catch { /* ignore */ }
+    };
+
+    // Proactive refresh: renew before expiry, then hand the new token to every device.
+    const scheduleRefresh = (): void => {
+      if (this.refreshTimer) { clearTimeout(this.refreshTimer); this.refreshTimer = null; }
+      const exp = Number(api.tokenExpiresAt) || 0;
+      if (!exp) { this.log.warn('Token expiry unknown — proactive refresh disabled'); return; }
+      const delay = Math.min(Math.max(exp - Date.now() - TOKEN_REFRESH_MARGIN_MS, 60_000), 2_000_000_000);
+      this.log.info(`Token valid until ${new Date(exp).toISOString()} — proactive refresh in ${(delay / 3_600_000).toFixed(1)} h`);
+      this.refreshTimer = setTimeout(async () => {
+        this.refreshTimer = null;
+        try {
+          await this.reauth();                    // re-login + saveToken() + scheduleRefresh()
+          for (const d of this.devices) d.applyRefreshedToken(api.user_access_token);
+        } catch (err) {
+          this.log.error(`Proactive token refresh failed: ${String(err)} — retrying in ${TOKEN_REFRESH_RETRY_MS / 60_000} min`);
+          api.tokenExpiresAt = Date.now() + TOKEN_REFRESH_MARGIN_MS + TOKEN_REFRESH_RETRY_MS;
+          scheduleRefresh();
+        }
+      }, delay);
     };
 
     const authenticate = async (): Promise<void> => {
@@ -1005,6 +1044,11 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
         return;
       }
       api.uid = deviceAuth.uid;
+      if (typeof api.completeLogin === 'function') {
+        // getAuthCode + loginByItToken, and tracks the token expiry (tokenExpiresAt)
+        await api.completeLogin(deviceAuth.accessToken);
+        return;
+      }
       const authResult = await api.callUserAuthApi('user/getAuthCode', {
         uid: deviceAuth.uid,
         accessToken: deviceAuth.accessToken,
@@ -1043,6 +1087,7 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
           try { fs.unlinkSync(tokenFile); } catch { /* ignore */ }
           await authenticate();
           saveToken();
+          scheduleRefresh();
         })().finally(() => { reauthInFlight = null; });
       }
       return reauthInFlight;
@@ -1063,6 +1108,7 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
       ? devices.filter(d => cfg.whiteList!.includes(d.did) || cfg.whiteList!.includes(d.nick))
       : devices;
     this.log.info(`Found ${filtered.length} Ecovacs device(s)`);
+    scheduleRefresh();
     for (const vac of filtered) {
       await this.registerVacuum(api, vac, cfg.pollingInterval ?? 15, cfg.rooms ?? []);
     }
@@ -1070,6 +1116,7 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
 
   async onStop(reason?: string): Promise<void> {
     this.log.info(`onStop(${reason})`);
+    if (this.refreshTimer) { clearTimeout(this.refreshTimer); this.refreshTimer = null; }
     await Promise.all(this.devices.map(d => d.disconnect()));
     this.devices = [];
   }

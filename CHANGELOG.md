@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 — 2026-10-04
+
+- **ecovacs-deebot 1.0.0-alpha.23** (pure MQTT/JSON rewrite). Requires Node ≥ 22.15. The XMPP stack and the native `canvas` dependency are gone (far fewer deprecated/vulnerable packages).
+- **Proactive token refresh**: the token validity reported at login (~7 days) is tracked and cached; the plugin re-authenticates 1 h before expiry and hands the new token to the live MQTT session (`updateUserAccessToken`). The 0.1.88 "Not authorized" recovery stays as a safety net.
+- Device-auth login goes through the library's `completeLogin()`.
+- Removed the `appVersion` patch (not needed with the 1.0 library).
+- `ErrorCode 0/100` (no error) is logged at info level.
+
 ## 0.1.90 — 2026-10-04
 
 - Detect the mop pad being reattached: the T30 pushes `WaterInfo.mopCount` (attached mop pads; 1 with a pad detached, 2 after reattaching), which ecovacs-deebot ignores. When the count goes up, the mop-pad error clears immediately. A `GetWaterInfo` request establishes the baseline at connect and when the error fires.

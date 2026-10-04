@@ -37,7 +37,7 @@ Ecovacs Cloud (MQTT)
 ## Requirements
 
 - [Matterbridge](https://github.com/Luligu/matterbridge) >= 3.7.0
-- Node.js >= 20 (22 or 24 LTS recommended)
+- Node.js >= 22.15 (24 LTS recommended)
 - An Ecovacs account (email + password)
 - A 950-type Deebot (T8, T9, T10, T20, T30, X1, X2 series and variants)
 
@@ -153,11 +153,11 @@ Developed and tested on **Deebot T30 Omni**. Should work with all 950-type proto
 
 ## Technical notes
 
-- Authentication tokens are cached in `~/.matterbridge/ecovacs-token.json` (mode 600) to avoid rate limiting. If the MQTT broker rejects the token ("Not authorized"), the plugin re-authenticates once, refreshes the cache and reconnects automatically.
+- Authentication tokens are cached in `~/.matterbridge/ecovacs-token.json` (mode 600) to avoid rate limiting. The token is renewed automatically about 1 h before it expires (validity ~7 days) without dropping the connection; if the MQTT broker ever rejects it ("Not authorized"), the plugin re-authenticates once, refreshes the cache and reconnects.
 - If Ecovacs requires device verification (error 1013), a verified device identity can be stored in `~/.matterbridge/ecovacs-device-auth.json` (`email`, `deviceId`, `uid`, `accessToken`); the plugin then logs in with that identity instead of email/password.
 - Robot errors are shown in Apple Home: while an error is active the vacuum reports the Matter `Error` state together with the error type.
 - Some warnings are sent by the robot as `Evt` messages, which `ecovacs-deebot` does not decode. Known codes are mapped: `1128` = mop pad missing → "Insert the mop pad" (clears as soon as the pad is reattached — detected through `WaterInfo.mopCount` — or after 60 s, on the next start or when cleaning begins); `1026` = charging dock not found (clears when the robot is back on the dock or cleaning). Other codes known to ecovacs-deebot are logged by name. Unknown codes are logged as `Unhandled Evt code: N` — please open an issue with the code and what the Ecovacs app showed.
-- The plugin auto-patches the `ecovacs-deebot` library at startup to ensure compatibility with the current Ecovacs API.
+- Built on `ecovacs-deebot` 1.0 (MQTT/JSON).
 
 ## License
 
