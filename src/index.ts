@@ -1,5 +1,10 @@
 /**
- * matterbridge-ecovacs  v0.2.0
+ * matterbridge-ecovacs  v0.2.1
+ *
+ * 0.2.1: Evt errors no longer auto-clear after 60 s: they stay until the problem is resolved
+ *   (mop pad reattached → WaterInfo.mopCount up; back on dock; ErrorCode 0; new Start; real cleaning).
+ *   Evt 1131 (bumper stuck, T30 Omni 2026-10-04) → Stuck. Removed the operationCompletion event
+ *   trigger: the event is not enabled on the endpoint, so it never fired and only logged an error.
  *
  * 0.2.0: ecovacs-deebot 1.0.0-alpha.23 (pure MQTT/JSON rewrite, Node >= 22.15, no canvas/XMPP deps).
  *   - Proactive token refresh: the login reports the token validity (~7 days); the plugin
@@ -87,19 +92,23 @@ const RUN   = { IDLE: 1, CLEANING: 2 } as const;
 const CLEAN = { VACUUM: 1, MOP: 2, VACUUM_AND_MOP: 3, VACUUM_THEN_MOP: 4 } as const;
 const OpState = RvcOperationalState.OperationalState;
 // 'Evt' codes (sent by 950-type robots, ignored by ecovacs-deebot) that map to a Matter error.
-//  - clear 'timeout': transient warning, cleared after EVT_ERROR_CLEAR_MS (like the Ecovacs app)
-//  - clear 'dock':    persistent problem, cleared when the robot is back on the dock
-// Any error is also cleared by a real cleaning start (CleanReport → Running).
-interface EvtErrorSpec { errId: number; clear: 'timeout' | 'dock'; }
+// The error stays until the problem is resolved:
+//  - clear 'pad':    mop pad reattached (WaterInfo.mopCount goes up)
+//  - clear 'dock':   robot back on the dock
+//  - clear 'action': no specific signal — cleared by the next Start (the robot re-sends the
+//                    Evt if the problem persists)
+// Every Evt error is also cleared by ErrorCode 0/100 and by a real cleaning start.
+interface EvtErrorSpec { errId: number; clear: 'pad' | 'dock' | 'action'; }
 const EVT_ERRORS: Record<number, EvtErrorSpec> = {
   // 1128 observed on T30 Omni 2026-10-04: mop pad detached, robot refuses to start (even vacuum-only)
-  1128: { errId: RvcOperationalState.ErrorState.MopCleaningPadMissing,    clear: 'timeout' },
+  1128: { errId: RvcOperationalState.ErrorState.MopCleaningPadMissing,    clear: 'pad' },
+  // 1131 observed on T30 Omni 2026-10-04: bumper stuck (app: "Il paracolpi è bloccato")
+  1131: { errId: RvcOperationalState.ErrorState.Stuck,                    clear: 'action' },
   // 1026 "Charging dock not found" (ecovacs-deebot eventCodes.json)
   1026: { errId: RvcOperationalState.ErrorState.FailedToFindChargingDock, clear: 'dock' },
 };
 // 1007 "Mop installed": resolves a pending mop-pad error immediately.
 const EVT_MOP_INSTALLED = 1007;
-const EVT_ERROR_CLEAR_MS = 60_000;
 // Proactive token refresh: renew this long before the expiry reported by the library.
 const TOKEN_REFRESH_MARGIN_MS = 60 * 60_000;      // 1 h
 const TOKEN_REFRESH_RETRY_MS  = 10 * 60_000;      // retry after a failed refresh
@@ -217,10 +226,9 @@ class EcovacsDevice {
 
   // True while the active error comes from an 'Evt' message (auto-clears after a timeout).
   private evtErrorActive = false;
-  private evtErrorClear: 'timeout' | 'dock' = 'timeout';
+  private evtErrorClear: 'pad' | 'dock' | 'action' = 'action';
   // Number of attached mop pads from WaterInfo.mopCount (-1 = unknown).
   private mopCount = -1;
-  private evtErrorTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Re-authentication callback injected by the platform (same path as startup login).
   reauth: (() => Promise<void>) | null = null;
@@ -369,12 +377,9 @@ class EcovacsDevice {
       //  - hasStartedCleaning is set (guards against startup false-positives)
       if (prevWasActive && nowDone && this.hasStartedCleaning) {
         this.hasStartedCleaning = false;
-        this.log.info(`[${this.name}] operationCompletion`);
-        await this.endpoint?.triggerEvent('RvcOperationalState', 'operationCompletion', {
-          completionErrorCode: 0,
-          totalOperationalTime: null,
-          pausedTime: null,
-        }, this.log);
+        // operationCompletion is not enabled on the RvcOperationalState server of this endpoint:
+        // triggerEvent always failed ("cluster rvcOperationalState not found"). Not emitted anymore.
+        this.log.info(`[${this.name}] Cleaning cycle completed`);
       }
     }, 100);
   }
@@ -512,7 +517,6 @@ class EcovacsDevice {
   async disconnect(): Promise<void> {
     this.shuttingDown = true;
     this.stopPolling();
-    if (this.evtErrorTimer)  { clearTimeout(this.evtErrorTimer);  this.evtErrorTimer = null; }
     if (this.authRetryTimer) { clearTimeout(this.authRetryTimer); this.authRetryTimer = null; }
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     if (this.opStateTimer)   { clearTimeout(this.opStateTimer);   this.opStateTimer = null; }
@@ -597,21 +601,10 @@ class EcovacsDevice {
     if (isActiveCleaning(this.cleanState)) this.cleanState = OpState.Stopped;
     this.writeRunMode(RUN.IDLE);
     this.applyState();
-    if (this.evtErrorTimer) { clearTimeout(this.evtErrorTimer); this.evtErrorTimer = null; }
-    if (spec.clear === 'timeout') {
-      this.evtErrorTimer = setTimeout(() => {
-        this.evtErrorTimer = null;
-        if (this.evtErrorActive) {
-          this.log.info(`[${this.name}] Evt error auto-cleared after ${EVT_ERROR_CLEAR_MS / 1000}s`);
-          this.clearEvtError(true);
-        }
-      }, EVT_ERROR_CLEAR_MS);
-    }
   }
 
   /** Clear an Evt-originated error (no-op if the active error came from ErrorCode). */
   private clearEvtError(apply: boolean): void {
-    if (this.evtErrorTimer) { clearTimeout(this.evtErrorTimer); this.evtErrorTimer = null; }
     if (!this.evtErrorActive) return;
     this.evtErrorActive = false;
     this.hasActiveError = false;

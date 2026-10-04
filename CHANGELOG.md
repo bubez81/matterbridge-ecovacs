@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 — 2026-10-04
+
+- `Evt` errors no longer auto-clear after 60 s: they stay in Apple Home until the problem is resolved — mop pad reattached (`WaterInfo.mopCount` goes up), robot back on the dock, `ErrorCode 0`, a new Start (the robot re-sends the code if the problem persists) or a real cleaning start.
+- `Evt 1131` (bumper stuck — app: "Il paracolpi è bloccato") → `Stuck`.
+- Removed the `operationCompletion` event trigger: the event is not enabled on the endpoint, so it never fired and only logged "cluster rvcOperationalState not found".
+- `repository.url` normalized (`npm pkg fix`).
+
 ## 0.2.0 — 2026-10-04
 
 - **ecovacs-deebot 1.0.0-alpha.23** (pure MQTT/JSON rewrite). Requires Node ≥ 22.15. The XMPP stack and the native `canvas` dependency are gone (far fewer deprecated/vulnerable packages).
