@@ -1,5 +1,10 @@
 /**
- * matterbridge-ecovacs  v0.1.88
+ * matterbridge-ecovacs  v0.1.89
+ *
+ * 0.1.89: Evt codes known to ecovacs-deebot (library/eventCodes.json) are logged by name.
+ *   Evt 1007 "Mop installed" clears the mop-pad error at once. Evt 1026 "Charging dock not
+ *   found" → FailedToFindChargingDock, kept until the robot is back on the dock or cleans again
+ *   (the problem persists, so the error must too). Unknown codes are still logged as warnings.
  *
  * 0.1.88: recover from an invalidated token. MQTT "Not authorized" (token rejected by the broker
  *   while REST still accepts it) now triggers a single-flight re-authentication through the same
@@ -68,12 +73,25 @@ const RUN   = { IDLE: 1, CLEANING: 2 } as const;
 const CLEAN = { VACUUM: 1, MOP: 2, VACUUM_AND_MOP: 3, VACUUM_THEN_MOP: 4 } as const;
 const OpState = RvcOperationalState.OperationalState;
 // 'Evt' codes (sent by 950-type robots, ignored by ecovacs-deebot) that map to a Matter error.
-// 1128 observed on T30 Omni 2026-10-04: mop pad detached, robot refuses to start (even vacuum-only).
-const EVT_ERRORS: Record<number, number> = {
-  1128: RvcOperationalState.ErrorState.MopCleaningPadMissing,
+//  - clear 'timeout': transient warning, cleared after EVT_ERROR_CLEAR_MS (like the Ecovacs app)
+//  - clear 'dock':    persistent problem, cleared when the robot is back on the dock
+// Any error is also cleared by a real cleaning start (CleanReport → Running).
+interface EvtErrorSpec { errId: number; clear: 'timeout' | 'dock'; }
+const EVT_ERRORS: Record<number, EvtErrorSpec> = {
+  // 1128 observed on T30 Omni 2026-10-04: mop pad detached, robot refuses to start (even vacuum-only)
+  1128: { errId: RvcOperationalState.ErrorState.MopCleaningPadMissing,    clear: 'timeout' },
+  // 1026 "Charging dock not found" (ecovacs-deebot eventCodes.json)
+  1026: { errId: RvcOperationalState.ErrorState.FailedToFindChargingDock, clear: 'dock' },
 };
-// Evt-based errors are transient (the Ecovacs app clears them too): auto-clear after this delay.
+// 1007 "Mop installed": resolves a pending mop-pad error immediately.
+const EVT_MOP_INSTALLED = 1007;
 const EVT_ERROR_CLEAR_MS = 60_000;
+
+// Human-readable names for Evt codes, from the library's own table (absent in some versions).
+let EVT_NAMES: Record<string, string> = {};
+try {
+  EVT_NAMES = (require('ecovacs-deebot/library/eventCodes.json') as { eventCodes?: Record<string, string> }).eventCodes ?? {};
+} catch { /* table not available: codes are logged as numbers */ }
 const RECONNECT_DELAYS = [5_000, 15_000, 30_000, 60_000, 120_000];
 
 // ── State-mapping helpers ──────────────────────────────────────────────────────
@@ -181,6 +199,7 @@ class EcovacsDevice {
 
   // True while the active error comes from an 'Evt' message (auto-clears after a timeout).
   private evtErrorActive = false;
+  private evtErrorClear: 'timeout' | 'dock' = 'timeout';
   private evtErrorTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Re-authentication callback injected by the platform (same path as startup login).
@@ -500,27 +519,40 @@ class EcovacsDevice {
   }
 
   private onEvt(code: number): void {
-    const errId = EVT_ERRORS[code];
-    if (errId === undefined) {
-      this.log.warn(`[${this.name}] Unhandled Evt code: ${code}`);
+    const evtName = EVT_NAMES[String(code)];
+    if (code === EVT_MOP_INSTALLED) {
+      this.log.info(`[${this.name}] Evt ${code} (${evtName ?? 'Mop installed'})`);
+      if (this.evtErrorActive && this.currentErrorId === RvcOperationalState.ErrorState.MopCleaningPadMissing) {
+        this.log.info(`[${this.name}] Mop pad error cleared (mop installed)`);
+        this.clearEvtError(true);
+      }
       return;
     }
-    this.log.warn(`[${this.name}] Evt ${code} → Matter error ${errId}`);
+    const spec = EVT_ERRORS[code];
+    if (!spec) {
+      if (evtName) this.log.info(`[${this.name}] Evt ${code} (${evtName})`);
+      else this.log.warn(`[${this.name}] Unhandled Evt code: ${code}`);
+      return;
+    }
+    this.log.warn(`[${this.name}] Evt ${code}${evtName ? ` (${evtName})` : ''} → Matter error ${spec.errId}`);
     this.hasActiveError = true;
     this.evtErrorActive = true;
-    this.currentErrorId = errId;
-    // The robot refused to start: drop the optimistic Running set by the Start command.
+    this.evtErrorClear = spec.clear;
+    this.currentErrorId = spec.errId;
+    // The robot refused to start / cannot proceed: drop the optimistic Running state.
     if (isActiveCleaning(this.cleanState)) this.cleanState = OpState.Stopped;
     this.writeRunMode(RUN.IDLE);
     this.applyState();
-    if (this.evtErrorTimer) clearTimeout(this.evtErrorTimer);
-    this.evtErrorTimer = setTimeout(() => {
-      this.evtErrorTimer = null;
-      if (this.evtErrorActive) {
-        this.log.info(`[${this.name}] Evt error auto-cleared after ${EVT_ERROR_CLEAR_MS / 1000}s`);
-        this.clearEvtError(true);
-      }
-    }, EVT_ERROR_CLEAR_MS);
+    if (this.evtErrorTimer) { clearTimeout(this.evtErrorTimer); this.evtErrorTimer = null; }
+    if (spec.clear === 'timeout') {
+      this.evtErrorTimer = setTimeout(() => {
+        this.evtErrorTimer = null;
+        if (this.evtErrorActive) {
+          this.log.info(`[${this.name}] Evt error auto-cleared after ${EVT_ERROR_CLEAR_MS / 1000}s`);
+          this.clearEvtError(true);
+        }
+      }, EVT_ERROR_CLEAR_MS);
+    }
   }
 
   /** Clear an Evt-originated error (no-op if the active error came from ErrorCode). */
@@ -602,6 +634,11 @@ class EcovacsDevice {
       this.log.info(`[${this.name}] ChargeState: ${v}`);
       const s = chargeStateToOpState(v);
       this.chargeState = s;
+      // Back on the dock: a 'dock'-type Evt error (e.g. charging dock not found) is resolved.
+      if ((s === OpState.Charging || s === OpState.Docked) && this.evtErrorActive && this.evtErrorClear === 'dock') {
+        this.log.info(`[${this.name}] Evt error cleared (robot back on dock)`);
+        this.clearEvtError(false);
+      }
       // Reset cleanState to Stopped when charging starts (unless actively cleaning)
       if (s === OpState.Charging && !isActiveCleaning(this.cleanState)) {
         this.cleanState = OpState.Stopped;

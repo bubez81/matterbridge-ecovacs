@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.89 — 2026-10-04
+
+- `Evt` codes known to ecovacs-deebot (`library/eventCodes.json`) are logged by name instead of "Unhandled".
+- `Evt 1007` (Mop installed) clears the mop-pad error immediately, without waiting 60 s.
+- `Evt 1026` (Charging dock not found) → `FailedToFindChargingDock` in Apple Home; it stays until the robot is back on the dock or starts cleaning, because the problem persists until then.
+
 ## 0.1.88 — 2026-10-04
 
 - Recover from an invalidated token: MQTT "Not authorized" now triggers a single-flight re-authentication (same device-auth path as startup), refreshes the token cache and reconnects. Previously the MQTT client retried forever with the dead token (robot unreachable, log grew to 100 MB).
