@@ -1,5 +1,13 @@
 /**
- * matterbridge-ecovacs  v0.2.1
+ * matterbridge-ecovacs  v0.2.2
+ *
+ * 0.2.2: Matterbridge calls onShutdown(), not onStop(): the cleanup never ran, so every in-process
+ *   restart left the old instance alive (own MQTT session, polling, writes to a destroyed endpoint).
+ *   Renamed to onShutdown() and chained to super. connect() now disposes the previous vacbot
+ *   (listeners removed, MQTT client ended even when offline, which stops mqtt.js auto-reconnect),
+ *   and only one reconnect timer can be pending. ErrorCode 500 (request timeout), 404 (recipient
+ *   unavailable) and 4200 (bot offline) are communication failures, not robot errors: no longer
+ *   shown as an error in Apple Home ("Impossibile completare la pulizia" after a 2-minute timeout).
  *
  * 0.2.1: Evt errors no longer auto-clear after 60 s: they stay until the problem is resolved
  *   (mop pad reattached → WaterInfo.mopCount up; back on dock; ErrorCode 0; new Start; real cleaning).
@@ -186,6 +194,14 @@ function ecovacsErrorToMatterError(code: number): number {
 
 function isActiveCleaning(s: number): boolean {
   return s === OpState.Running || s === OpState.Paused;
+}
+
+/** ecovacs-deebot error codes that mean "the command didn't get through", not a robot fault. */
+const COMM_ERROR_CODES = new Set([404, 500, 4200]);
+
+/** Transport-level 'Error' messages (timeouts, DNS, MQTT link): no robot fault behind them. */
+function isCommError(msg: string): boolean {
+  return /Request Timeout|Recipient unavailable|Network connectivity|DNS lookup|MQTT (client|server)/.test(msg);
 }
 
 // ── Interfaces ────────────────────────────────────────────────────────────────
@@ -469,6 +485,7 @@ class EcovacsDevice {
   async connect(): Promise<void> {
     if (this.shuttingDown) return;
     this.log.info(`[${this.name}] Connecting (attempt ${this.reconnectAttempt + 1})`);
+    await this.disposeVacbot();
     try { this.vacbot = this.api.getVacBotObj(this.vacuum); }
     catch (err) {
       this.log.error(`[${this.name}] getVacBotObj failed: ${String(err)}`);
@@ -502,7 +519,7 @@ class EcovacsDevice {
       }
       this.log.warn(`[${this.name}] Vacbot error: ${msg}`);
       if (!msg || msg.includes('not reachable') || msg.includes('IndexSizeError') ||
-          msg.includes('NoError') || msg.includes('source width is 0')) return;
+          msg.includes('NoError') || msg.includes('source width is 0') || isCommError(msg)) return;
       this.cleanState = OpState.Error;
       this.applyState();
     });
@@ -521,7 +538,22 @@ class EcovacsDevice {
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     if (this.opStateTimer)   { clearTimeout(this.opStateTimer);   this.opStateTimer = null; }
     if (this.areasTimer)     { clearTimeout(this.areasTimer);      this.areasTimer = null; }
-    try { if (this.vacbot) await this.vacbot.disconnectAsync(); } catch { /* ignore */ }
+    await this.disposeVacbot();
+  }
+
+  /**
+   * Tear down the current vacbot so it can't outlive a reconnect. ecovacs-deebot's disconnect
+   * skips client.end() when the MQTT client is offline, and mqtt.js then keeps reconnecting on
+   * its own: a second live session next to the new one. Listeners go first, so the old
+   * session's 'disconnect' can't schedule yet another reconnect.
+   */
+  private async disposeVacbot(): Promise<void> {
+    const old = this.vacbot;
+    if (!old) return;
+    this.vacbot = null;
+    try { old.ecovacs?.removeAllListeners?.(); } catch { /* ignore */ }
+    try { await old.disconnectAsync(); } catch { /* ignore */ }
+    try { old.client?.end?.(true); } catch { /* ignore */ }
   }
 
   // ── Evt messages ─────────────────────────────────────────────────────────────
@@ -655,7 +687,7 @@ class EcovacsDevice {
   }
 
   private scheduleReconnect(): void {
-    if (this.shuttingDown) return;
+    if (this.shuttingDown || this.reconnectTimer) return; // one pending reconnect at a time
     const delay = RECONNECT_DELAYS[Math.min(this.reconnectAttempt, RECONNECT_DELAYS.length - 1)];
     this.reconnectAttempt++;
     this.reconnectTimer = setTimeout(async () => {
@@ -728,6 +760,10 @@ class EcovacsDevice {
       // -1 is emitted by ecovacs-deebot for client/connection failures (e.g. MQTT not
       // authorized), not by the robot: never surface it as a robot error in Apple Home.
       if (code === -1 || Number.isNaN(code)) return;
+      // 500 request timeout, 404 recipient unavailable, 4200 bot offline: the command didn't
+      // get through (cloud/robot link), the robot itself has no fault. Leave the state alone;
+      // the next successful response emits ErrorCode 0.
+      if (COMM_ERROR_CODES.has(code)) return;
       if (code === 0 || code === 100) {
         this.log.info(`[${this.name}] ErrorCode: ${code} (no error)`);
         this.clearEvtError(false);
@@ -1108,11 +1144,13 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
     }
   }
 
-  async onStop(reason?: string): Promise<void> {
-    this.log.info(`onStop(${reason})`);
+  // Matterbridge calls onShutdown() (never onStop()) on shutdown and on in-process restarts.
+  async onShutdown(reason?: string): Promise<void> {
+    this.log.info(`onShutdown(${reason})`);
     if (this.refreshTimer) { clearTimeout(this.refreshTimer); this.refreshTimer = null; }
     await Promise.all(this.devices.map(d => d.disconnect()));
     this.devices = [];
+    await super.onShutdown(reason);
   }
 
   async onConfigure(): Promise<void> { this.log.info('onConfigure'); }

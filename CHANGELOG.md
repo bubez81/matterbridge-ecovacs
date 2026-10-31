@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 — 2026-10-31
+
+- **Plugin shutdown actually runs**: Matterbridge calls `onShutdown()`, never `onStop()`, so the cleanup never ran. On every in-process restart the old instance stayed alive with its own MQTT session and polling, writing to a destroyed endpoint (`Endpoint … is in the destroyed state`). Renamed to `onShutdown()`, chained to the base implementation.
+- **No more duplicate robot sessions**: `connect()` disposes the previous vacbot first (listeners removed, MQTT client ended even when offline — ecovacs-deebot skips `client.end()` then, and mqtt.js kept reconnecting on its own). Only one reconnect timer can be pending.
+- **Communication failures are not robot errors**: `ErrorCode 500` (request timeout), `404` (recipient unavailable) and `4200` (bot offline), and transport `Error` messages (timeouts, DNS, MQTT link), no longer put the robot in Error in Apple Home. A 2-minute cloud timeout showed "Impossibile completare la pulizia".
+
 ## 0.2.1 — 2026-10-04
 
 - `Evt` errors no longer auto-clear after 60 s: they stay in Apple Home until the problem is resolved — mop pad reattached (`WaterInfo.mopCount` goes up), robot back on the dock, `ErrorCode 0`, a new Start (the robot re-sends the code if the problem persists) or a real cleaning start.
