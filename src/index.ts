@@ -1,5 +1,11 @@
 /**
- * matterbridge-ecovacs  v0.2.2
+ * matterbridge-ecovacs  v0.2.3
+ *
+ * 0.2.3: the T30 reports cleaning as CleanInfo state 'clean' with a clean type missing from
+ *   ecovacs-deebot's dictionary: CleanReport came out undefined for the whole cycle, so Apple Home
+ *   showed the robot docked while it cleaned (2026-11-07 09:30-10:43). The raw CleanInfo is now
+ *   hooked: state 'clean' → Running (motionState pause → Paused) whatever the type. Each distinct
+ *   'clean' shape is logged once.
  *
  * 0.2.2: Matterbridge calls onShutdown(), not onStop(): the cleanup never ran, so every in-process
  *   restart left the old instance alive (own MQTT session, polling, writes to a destroyed endpoint).
@@ -196,6 +202,16 @@ function isActiveCleaning(s: number): boolean {
   return s === OpState.Running || s === OpState.Paused;
 }
 
+/**
+ * Op state from a raw CleanInfo payload, independent of the library's clean-type dictionary.
+ * Only state 'clean' is decided here (motionState pause → Paused, anything else → Running);
+ * null for every other state, which the library maps fine.
+ */
+function rawCleanInfoToOpState(payload: any): number | null {
+  if (payload?.state !== 'clean') return null;
+  return payload.cleanState?.motionState === 'pause' ? OpState.Paused : OpState.Running;
+}
+
 /** ecovacs-deebot error codes that mean "the command didn't get through", not a robot fault. */
 const COMM_ERROR_CODES = new Set([404, 500, 4200]);
 
@@ -245,6 +261,9 @@ class EcovacsDevice {
   private evtErrorClear: 'pad' | 'dock' | 'action' = 'action';
   // Number of attached mop pads from WaterInfo.mopCount (-1 = unknown).
   private mopCount = -1;
+  // Op state from the last raw CleanInfo payload when it says 'clean' (null otherwise).
+  private rawCleanState: number | null = null;
+  private seenCleanShapes = new Set<string>();
 
   // Re-authentication callback injected by the platform (same path as startup login).
   reauth: (() => Promise<void>) | null = null;
@@ -494,6 +513,7 @@ class EcovacsDevice {
     }
     this.hookEvt();
     this.hookWaterInfo();
+    this.hookCleanInfo();
     this.listenVacbotEvents();
     this.vacbot.connect();
     this.vacbot.on('ready', () => {
@@ -588,6 +608,37 @@ class EcovacsDevice {
       };
     } catch (e) {
       this.log.warn(`[${this.name}] Could not hook WaterInfo: ${String(e)}`);
+    }
+  }
+
+  /**
+   * ecovacs-deebot maps CleanInfo through a fixed dictionary of clean types: the T30 sends
+   * state 'clean' with a type it doesn't know, and CleanReport comes out undefined for the
+   * whole cycle (Apple Home showed the robot docked while it cleaned). Keep the raw state
+   * so the CleanReport handler can fall back to it.
+   */
+  private hookCleanInfo(): void {
+    try {
+      if (typeof this.vacbot?.handleCleanInfo !== 'function') return;
+      const orig = this.vacbot.handleCleanInfo.bind(this.vacbot);
+      this.vacbot.handleCleanInfo = (payload: any) => {
+        try {
+          this.rawCleanState = rawCleanInfoToOpState(payload);
+          // Log each distinct 'clean' shape once: tells which types the library is missing.
+          if (payload?.state === 'clean') {
+            const cs = payload.cleanState ?? {};
+            const type = typeof cs.content === 'object' ? cs.content?.type : cs.type;
+            const shape = `type=${type} motionState=${cs.motionState} trigger=${payload.trigger}`;
+            if (!this.seenCleanShapes.has(shape)) {
+              this.seenCleanShapes.add(shape);
+              this.log.info(`[${this.name}] CleanInfo clean: ${shape}`);
+            }
+          }
+        } catch { this.rawCleanState = null; }
+        return orig(payload);
+      };
+    } catch (e) {
+      this.log.warn(`[${this.name}] Could not hook CleanInfo: ${String(e)}`);
     }
   }
 
@@ -705,7 +756,16 @@ class EcovacsDevice {
 
     this.vacbot.on('CleanReport', (v: string) => {
       this.log.info(`[${this.name}] CleanReport: ${v}`);
-      const s = cleanReportToOpState(v);
+      let s = cleanReportToOpState(v);
+      // Unknown clean type: the library reports undefined, the raw payload still says 'clean'.
+      // The hook sets rawCleanState right before this emit: consume it, so it can never be stale.
+      const raw = this.rawCleanState;
+      this.rawCleanState = null;
+      if (v === undefined && raw !== null) {
+        s = raw;
+        const label = (RvcOperationalState.OperationalState as Record<number, string>)[s] ?? String(s);
+        this.log.info(`[${this.name}] CleanReport undefined, raw CleanInfo says ${label}`);
+      }
       this.cleanState = s;
       // Mark that actual cleaning happened in this session so operationCompletion
       // fires when the robot docks — but only if it really cleaned.

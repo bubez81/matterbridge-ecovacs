@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.3 — 2026-11-08
+
+- **Cleaning shown in Apple Home again**: the T30 reports cleaning as `CleanInfo` state `clean` with a clean type that ecovacs-deebot's dictionary doesn't know, so `CleanReport` came out `undefined` for the whole cycle and the robot looked docked while cleaning. The raw `CleanInfo` is now hooked: state `clean` → Running (`motionState` pause → Paused) whatever the type. Each distinct `clean` shape (type / motionState / trigger) is logged once.
+
 ## 0.2.2 — 2026-10-31
 
 - **Plugin shutdown actually runs**: Matterbridge calls `onShutdown()`, never `onStop()`, so the cleanup never ran. On every in-process restart the old instance stayed alive with its own MQTT session and polling, writing to a destroyed endpoint (`Endpoint … is in the destroyed state`). Renamed to `onShutdown()`, chained to the base implementation.
