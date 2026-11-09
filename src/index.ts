@@ -1,5 +1,9 @@
 /**
- * matterbridge-ecovacs  v0.2.4
+ * matterbridge-ecovacs  v0.2.5
+ *
+ * 0.2.5: every distinct non-'clean' CleanInfo state is logged once with its raw payload: the T30
+ *   leaving a cycle to wash its mops comes out as CleanReport undefined (Home showed Docked for a
+ *   minute instead of SeekingCharger), and the raw state is needed to map it.
  *
  * 0.2.4: Matter 1.4 dock states are back. 0.1.79 removed CleaningMop/EmptyingDustBin because
  *   the HomePod got stuck on "Aggiornamento"; that was the pre-rewrite plugin, and other
@@ -652,6 +656,15 @@ class EcovacsDevice {
             if (!this.seenCleanShapes.has(shape)) {
               this.seenCleanShapes.add(shape);
               this.log.info(`[${this.name}] CleanInfo clean: ${shape}`);
+            }
+          } else {
+            // Other states (idle, goCharging, washing, ...): log each distinct one once with its
+            // raw payload. One of them comes out as CleanReport undefined when the T30 leaves
+            // a cycle to wash its mops (2026-11-09 08:26): this tells which.
+            const shape = `state=${payload?.state} trigger=${payload?.trigger}`;
+            if (!this.seenCleanShapes.has(shape)) {
+              this.seenCleanShapes.add(shape);
+              this.log.info(`[${this.name}] CleanInfo ${shape}: ${JSON.stringify(payload ?? null).slice(0, 400)}`);
             }
           }
         } catch { this.rawCleanState = null; }

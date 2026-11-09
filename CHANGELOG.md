@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.5 — 2026-11-09
+
+- Confirmed with the user's HomePods (latest firmware): CleaningMop shows in Apple Home ("pulizia del panno") and the state goes back to cleaning afterwards, no "Updating" hang.
+- Each distinct non-`clean` `CleanInfo` state is logged once with its raw payload. When the T30 leaves a cycle to wash its mops, `CleanReport` comes out `undefined` and Home showed Docked for about a minute instead of returning to the dock: the raw state is needed to map it.
+
 ## 0.2.4 — 2026-11-09
 
 - **Dock states in Apple Home (Matter 1.4)**: the robot now advertises EmptyingDustBin, CleaningMop, FillingWaterTank and UpdatingMaps. Mop washing at the dock (before, during and after a cycle: `CleanReport` `washing`, or `StationState` self-cleaning) shows as CleaningMop instead of Charging; the auto-empty station (`AutoEmptyStatus` stationActive) shows as EmptyingDustBin. 0.1.79 had removed these states because the HomePod got stuck on "Updating"; that was the pre-rewrite plugin, and other Apple-Home-only plugins now ship them. Each dock flag expires after 5 minutes without a refresh, so a missed "end" message can't leave Home stuck.
