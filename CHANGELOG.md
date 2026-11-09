@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.6 — 2026-11-09
+
+- **Returning to wash the mops shown in Apple Home**: when the T30 leaves a cycle to wash its mops it sends `CleanInfo` state `goCharging-washing`, which ecovacs-deebot doesn't know: `CleanReport` came out `undefined` and Home showed Docked for the whole drive back. Any raw state starting with `goCharging` now maps to SeekingCharger.
+
 ## 0.2.5 — 2026-11-09
 
 - Confirmed with the user's HomePods (latest firmware): CleaningMop shows in Apple Home ("pulizia del panno") and the state goes back to cleaning afterwards, no "Updating" hang.

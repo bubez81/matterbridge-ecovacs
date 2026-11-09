@@ -1,5 +1,9 @@
 /**
- * matterbridge-ecovacs  v0.2.5
+ * matterbridge-ecovacs  v0.2.6
+ *
+ * 0.2.6: CleanInfo state 'goCharging-washing' (the T30 leaving a cycle to wash its mops) is not in
+ *   ecovacs-deebot's dictionary: CleanReport came out undefined and Home showed Docked while the
+ *   robot drove back. Any raw state starting with 'goCharging' → SeekingCharger.
  *
  * 0.2.5: every distinct non-'clean' CleanInfo state is logged once with its raw payload: the T30
  *   leaving a cycle to wash its mops comes out as CleanReport undefined (Home showed Docked for a
@@ -221,6 +225,9 @@ function isActiveCleaning(s: number): boolean {
  * null for every other state, which the library maps fine.
  */
 function rawCleanInfoToOpState(payload: any): number | null {
+  // Compound return states missing from the dictionary, e.g. 'goCharging-washing' (the T30
+  // leaving a cycle to wash its mops, 2026-11-09 08:44): returning to the dock.
+  if (typeof payload?.state === 'string' && payload.state.startsWith('goCharging')) return OpState.SeekingCharger;
   if (payload?.state !== 'clean') return null;
   return payload.cleanState?.motionState === 'pause' ? OpState.Paused : OpState.Running;
 }
