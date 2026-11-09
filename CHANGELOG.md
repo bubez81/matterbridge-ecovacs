@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.7 — 2026-11-09
+
+- **No false "Stuck" at the end of a cycle**: the T30 sends `Evt 1131` (bumper stuck) also when, back on the dock, it starts drying its mops (2026-11-09 17:49, app: "asciugatura dei panni"), and Home kept showing the error. 1131 is now an error only when the robot is off the dock; on the dock it is logged.
+- Log line "Cleaning cycle completed" renamed "Back on the dock after cleaning": it also fires on mid-cycle returns to wash the mops.
+
 ## 0.2.6 — 2026-11-09
 
 - **Returning to wash the mops shown in Apple Home**: when the T30 leaves a cycle to wash its mops it sends `CleanInfo` state `goCharging-washing`, which ecovacs-deebot doesn't know: `CleanReport` came out `undefined` and Home showed Docked for the whole drive back. Any raw state starting with `goCharging` now maps to SeekingCharger.

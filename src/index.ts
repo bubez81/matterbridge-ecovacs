@@ -1,5 +1,10 @@
 /**
- * matterbridge-ecovacs  v0.2.6
+ * matterbridge-ecovacs  v0.2.7
+ *
+ * 0.2.7: Evt 1131 (bumper stuck) is also sent with the robot on the dock when it starts drying
+ *   its mops at the end of a cycle (2026-11-09 17:49): Home showed Stuck while the app said
+ *   "drying". 1131 is now an error only when the robot is off the dock. 'Cleaning cycle completed'
+ *   log renamed 'Back on the dock after cleaning' (it also fires on mid-cycle mop-wash returns).
  *
  * 0.2.6: CleanInfo state 'goCharging-washing' (the T30 leaving a cycle to wash its mops) is not in
  *   ecovacs-deebot's dictionary: CleanReport came out undefined and Home showed Docked while the
@@ -129,12 +134,14 @@ const OpState = RvcOperationalState.OperationalState;
 //  - clear 'action': no specific signal — cleared by the next Start (the robot re-sends the
 //                    Evt if the problem persists)
 // Every Evt error is also cleared by ErrorCode 0/100 and by a real cleaning start.
-interface EvtErrorSpec { errId: number; clear: 'pad' | 'dock' | 'action'; }
+interface EvtErrorSpec { errId: number; clear: 'pad' | 'dock' | 'action'; awayOnly?: boolean; }
 const EVT_ERRORS: Record<number, EvtErrorSpec> = {
   // 1128 observed on T30 Omni 2026-10-04: mop pad detached, robot refuses to start (even vacuum-only)
   1128: { errId: RvcOperationalState.ErrorState.MopCleaningPadMissing,    clear: 'pad' },
-  // 1131 observed on T30 Omni 2026-10-04: bumper stuck (app: "Il paracolpi è bloccato")
-  1131: { errId: RvcOperationalState.ErrorState.Stuck,                    clear: 'action' },
+  // 1131 observed on T30 Omni 2026-10-04: bumper stuck (app: "Il paracolpi è bloccato").
+  // Also sent at the end of a cycle with the robot on the dock starting to dry its mops
+  // (2026-11-09 17:49, app: "asciugatura dei panni"): only an error when off the dock.
+  1131: { errId: RvcOperationalState.ErrorState.Stuck,                    clear: 'action', awayOnly: true },
   // 1026 "Charging dock not found" (ecovacs-deebot eventCodes.json)
   1026: { errId: RvcOperationalState.ErrorState.FailedToFindChargingDock, clear: 'dock' },
 };
@@ -442,7 +449,7 @@ class EcovacsDevice {
         this.hasStartedCleaning = false;
         // operationCompletion is not enabled on the RvcOperationalState server of this endpoint:
         // triggerEvent always failed ("cluster rvcOperationalState not found"). Not emitted anymore.
-        this.log.info(`[${this.name}] Cleaning cycle completed`);
+        this.log.info(`[${this.name}] Back on the dock after cleaning`);
       }
     }, 100);
   }
@@ -767,6 +774,12 @@ class EcovacsDevice {
     if (!spec) {
       if (evtName) this.log.info(`[${this.name}] Evt ${code} (${evtName})`);
       else this.log.warn(`[${this.name}] Unhandled Evt code: ${code}`);
+      return;
+    }
+    // Charging = physically on the dock (also while Paused there mid-cycle, as at 17:49).
+    const onDock = this.chargeState === OpState.Charging;
+    if (spec.awayOnly && onDock) {
+      this.log.info(`[${this.name}] Evt ${code}${evtName ? ` (${evtName})` : ''} with the robot on the dock: not an error`);
       return;
     }
     this.log.warn(`[${this.name}] Evt ${code}${evtName ? ` (${evtName})` : ''} → Matter error ${spec.errId}`);
