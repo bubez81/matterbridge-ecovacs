@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.4 — 2026-11-09
+
+- **Dock states in Apple Home (Matter 1.4)**: the robot now advertises EmptyingDustBin, CleaningMop, FillingWaterTank and UpdatingMaps. Mop washing at the dock (before, during and after a cycle: `CleanReport` `washing`, or `StationState` self-cleaning) shows as CleaningMop instead of Charging; the auto-empty station (`AutoEmptyStatus` stationActive) shows as EmptyingDustBin. 0.1.79 had removed these states because the HomePod got stuck on "Updating"; that was the pre-rewrite plugin, and other Apple-Home-only plugins now ship them. Each dock flag expires after 5 minutes without a refresh, so a missed "end" message can't leave Home stuck.
+- No T30 signal is known yet for FillingWaterTank and UpdatingMaps: the raw station / work / map / water messages are logged (each distinct shape once, max 30 per message) to find them.
+- `CleanReport` and `ChargeState` are logged only when they change (the T30 repeats `washing` every second).
+
 ## 0.2.3 — 2026-11-08
 
 - **Cleaning shown in Apple Home again**: the T30 reports cleaning as `CleanInfo` state `clean` with a clean type that ecovacs-deebot's dictionary doesn't know, so `CleanReport` came out `undefined` for the whole cycle and the robot looked docked while cleaning. The raw `CleanInfo` is now hooked: state `clean` → Running (`motionState` pause → Paused) whatever the type. Each distinct `clean` shape (type / motionState / trigger) is logged once.

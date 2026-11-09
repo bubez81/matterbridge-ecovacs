@@ -1,5 +1,14 @@
 /**
- * matterbridge-ecovacs  v0.2.3
+ * matterbridge-ecovacs  v0.2.4
+ *
+ * 0.2.4: Matter 1.4 dock states are back. 0.1.79 removed CleaningMop/EmptyingDustBin because
+ *   the HomePod got stuck on "Aggiornamento"; that was the pre-rewrite plugin, and other
+ *   Apple-Home-only plugins (matterbridge-dyson-robot) now ship these states. operationalStateList
+ *   advertises EmptyingDustBin (67), CleaningMop (68), FillingWaterTank (69), UpdatingMaps (70).
+ *   Mapped: CleanReport 'washing' and StationState self-cleaning → CleaningMop; AutoEmptyStatus
+ *   stationActive → EmptyingDustBin. No known T30 signal yet for 69/70: the raw station/work/map
+ *   messages are logged (distinct shapes, capped) to find them. CleanReport/ChargeState are logged
+ *   only when they change (the T30 repeats 'washing' every second).
  *
  * 0.2.3: the T30 reports cleaning as CleanInfo state 'clean' with a clean type missing from
  *   ecovacs-deebot's dictionary: CleanReport came out undefined for the whole cycle, so Apple Home
@@ -264,6 +273,14 @@ class EcovacsDevice {
   // Op state from the last raw CleanInfo payload when it says 'clean' (null otherwise).
   private rawCleanState: number | null = null;
   private seenCleanShapes = new Set<string>();
+  // Dock activity (Matter 1.4): CleaningMop / EmptyingDustBin / FillingWaterTank, null = none.
+  // Shown only while the robot is not cleaning, returning or in error (see applyState).
+  private washing = false;        // CleanReport 'washing' / StationState self-cleaning
+  private emptying = false;       // AutoEmptyStatus stationActive
+  private lastCleanReport: string | null | undefined = null;
+  private lastChargeReport: string | null = null;
+  // Raw message shapes already logged, per command (capped).
+  private seenRaw = new Map<string, Set<string>>();
 
   // Re-authentication callback injected by the platform (same path as startup login).
   reauth: (() => Promise<void>) | null = null;
@@ -480,10 +497,8 @@ class EcovacsDevice {
 
   /**
    * Resolve the final operationalState and push it + error state to matter.js.
-   * CleanReport wins for Running / Paused / SeekingCharger.
-   * ChargeState wins for everything else (including mop-wash, auto-empty, idle).
-   * States 67 (EmptyingDustBin) and 68 (CleaningMop) are never emitted —
-   * they are Matter 1.4 values that Apple Home HomePod doesn't recognize.
+   * Error > CleanReport (Running / Paused / SeekingCharger) > dock activity
+   * (EmptyingDustBin, CleaningMop) > ChargeState (Charging / Docked).
    */
   private applyState(): void {
     // While an error is active, operationalState MUST be Error: Matterbridge's RVC server
@@ -494,6 +509,8 @@ class EcovacsDevice {
       ? OpState.Error
       : (isActiveCleaning(this.cleanState) || this.cleanState === OpState.SeekingCharger)
         ? this.cleanState
+        : this.emptying ? OpState.EmptyingDustBin
+        : this.washing ? OpState.CleaningMop
         : this.chargeState;
     this.applyError();
     this.scheduleOpState(resolved);
@@ -514,6 +531,7 @@ class EcovacsDevice {
     this.hookEvt();
     this.hookWaterInfo();
     this.hookCleanInfo();
+    this.hookRawMessages();
     this.listenVacbotEvents();
     this.vacbot.connect();
     this.vacbot.on('ready', () => {
@@ -558,6 +576,8 @@ class EcovacsDevice {
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     if (this.opStateTimer)   { clearTimeout(this.opStateTimer);   this.opStateTimer = null; }
     if (this.areasTimer)     { clearTimeout(this.areasTimer);      this.areasTimer = null; }
+    if (this.washTimer)      { clearTimeout(this.washTimer);       this.washTimer = null; }
+    if (this.emptyTimer)     { clearTimeout(this.emptyTimer);      this.emptyTimer = null; }
     await this.disposeVacbot();
   }
 
@@ -640,6 +660,62 @@ class EcovacsDevice {
     } catch (e) {
       this.log.warn(`[${this.name}] Could not hook CleanInfo: ${String(e)}`);
     }
+  }
+
+  /**
+   * Log the raw payload of the dock/state messages, each distinct shape once (max 30 per
+   * command). The T30's signals for FillingWaterTank / UpdatingMaps are not known yet: this
+   * shows what the robot actually sends during a cycle.
+   */
+  private hookRawMessages(): void {
+    try {
+      const disp = this.vacbot?.ecovacs?.dispatcher;
+      if (typeof disp?.handleMessagePayload !== 'function') return;
+      const orig = disp.handleMessagePayload.bind(disp);
+      const WATCH = /Station|AutoEmpty|WorkState|Relocation|MapState|BuildMap|Mapping|Water|AirDr|DryingDuration|WashInfo/i;
+      disp.handleMessagePayload = (command: string, payload: any) => {
+        try {
+          const name = String(command).replace(/^_+|_+$/g, '');
+          if (WATCH.test(name)) {
+            const shape = JSON.stringify(payload ?? null).slice(0, 400);
+            let seen = this.seenRaw.get(name);
+            if (!seen) { seen = new Set(); this.seenRaw.set(name, seen); }
+            if (seen.size < 30 && !seen.has(shape)) {
+              seen.add(shape);
+              this.log.info(`[${this.name}] Raw ${name}: ${shape}`);
+            }
+          }
+        } catch { /* logging only */ }
+        return orig(command, payload);
+      };
+    } catch (e) {
+      this.log.warn(`[${this.name}] Could not hook raw messages: ${String(e)}`);
+    }
+  }
+
+  /**
+   * Dock activity flags. Each one also expires on its own (staleMs without a refresh), so a
+   * missed "end" message can never leave Apple Home stuck on a dock state.
+   */
+  private washTimer: ReturnType<typeof setTimeout> | null = null;
+  private emptyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private setWashing(on: boolean): void {
+    if (this.washTimer) { clearTimeout(this.washTimer); this.washTimer = null; }
+    if (on) this.washTimer = setTimeout(() => { this.washTimer = null; this.setWashing(false); }, 5 * 60_000);
+    if (on === this.washing) return;
+    this.washing = on;
+    this.log.info(`[${this.name}] Mop washing ${on ? 'started' : 'ended'}`);
+    this.applyState();
+  }
+
+  private setEmptying(on: boolean): void {
+    if (this.emptyTimer) { clearTimeout(this.emptyTimer); this.emptyTimer = null; }
+    if (on) this.emptyTimer = setTimeout(() => { this.emptyTimer = null; this.setEmptying(false); }, 5 * 60_000);
+    if (on === this.emptying) return;
+    this.emptying = on;
+    this.log.info(`[${this.name}] Dust bin emptying ${on ? 'started' : 'ended'}`);
+    this.applyState();
   }
 
   private onMopCount(count: number): void {
@@ -755,7 +831,11 @@ class EcovacsDevice {
   private listenVacbotEvents(): void {
 
     this.vacbot.on('CleanReport', (v: string) => {
-      this.log.info(`[${this.name}] CleanReport: ${v}`);
+      if (v !== this.lastCleanReport) this.log.info(`[${this.name}] CleanReport: ${v}`);
+      this.lastCleanReport = v;
+      // Mop washing at the dock (before, during and after a cycle): CleaningMop. The T30
+      // repeats 'washing' every second while it lasts; anything else ends it.
+      this.setWashing(v === 'washing');
       let s = cleanReportToOpState(v);
       // Unknown clean type: the library reports undefined, the raw payload still says 'clean'.
       // The hook sets rawCleanState right before this emit: consume it, so it can never be stale.
@@ -782,7 +862,8 @@ class EcovacsDevice {
     });
 
     this.vacbot.on('ChargeState', (v: string) => {
-      this.log.info(`[${this.name}] ChargeState: ${v}`);
+      if (v !== this.lastChargeReport) this.log.info(`[${this.name}] ChargeState: ${v}`);
+      this.lastChargeReport = v;
       const s = chargeStateToOpState(v);
       this.chargeState = s;
       // Back on the dock: a 'dock'-type Evt error (e.g. charging dock not found) is resolved.
@@ -846,16 +927,14 @@ class EcovacsDevice {
       this.log.warn(`[${this.name}] Robot error: ${description}`);
     });
 
-    // MopWash and EmptyDustBin: the robot is at the dock.
-    // chargeState (Charging or Docked) wins in applyState — no state change needed.
-    // States 68 (CleaningMop) and 67 (EmptyingDustBin) are Matter 1.4, not supported by
-    // Apple Home HomePod firmware. Sending them causes permanent "Aggiornamento".
-    this.vacbot.on('MopWash', (v: string) => {
-      this.log.info(`[${this.name}] MopWash: ${v} — robot at dock, chargeState wins`);
+    // Dock activity (Matter 1.4 states, see applyState).
+    this.vacbot.on('AutoEmptyStatus', (st: any) => {
+      this.setEmptying(Boolean(st?.stationActive));
     });
 
-    this.vacbot.on('EmptyDustBin', (v: string) => {
-      this.log.info(`[${this.name}] EmptyDustBin: ${v} — robot at dock, chargeState wins`);
+    this.vacbot.on('StationState', (st: any) => {
+      // type 3 = station self-cleaning (mop wash); type 2 = air drying (hours: stays Charging).
+      if (st?.type === 3) this.setWashing(Boolean(st.isSelfCleaning));
     });
 
     this.vacbot.on('StatusInfo', (v: unknown) => {
@@ -1258,8 +1337,11 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
         { operationalStateId: OpState.SeekingCharger },
         { operationalStateId: OpState.Charging },
         { operationalStateId: OpState.Docked },
-        // CleaningMop (68) and EmptyingDustBin (67) intentionally omitted:
-        // Matter 1.4 states not supported by Apple Home HomePod firmware.
+        // Matter 1.4 dock states (removed in 0.1.79, back in 0.2.4: see header).
+        { operationalStateId: OpState.EmptyingDustBin },
+        { operationalStateId: OpState.CleaningMop },
+        { operationalStateId: OpState.FillingWaterTank },
+        { operationalStateId: OpState.UpdatingMaps },
       ],
       initialAreas,
       [],                  // selectedAreas
@@ -1270,10 +1352,8 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
     device.bindEndpoint(endpoint);
     this.devices.push(device);
     await this.registerDevice(endpoint as unknown as MatterbridgeEndpoint);
-    // Force-write Docked immediately after the endpoint becomes active. This evicts any
-    // stale operationalState persisted from old plugin versions (CleaningMop=68 from <0.1.79).
-    // matter.js compares against its in-memory value: if persisted≠66 a subscription
-    // notification is sent so Apple Home never sees an unknown state in the initial report.
+    // Force-write Docked immediately after the endpoint becomes active, so the initial report
+    // never carries a stale operationalState persisted by a previous run.
     // setAttribute bypasses matterbridge's own deepEqual guard and always calls setStateOf.
     await endpoint.setAttribute('RvcOperationalState', 'operationalState', OpState.Docked, this.log);
     device.connect().catch((err: unknown) => this.log.error(`[${name}] connect failed: ${String(err)}`));
