@@ -1,5 +1,10 @@
 /**
- * matterbridge-ecovacs  v0.2.9
+ * matterbridge-ecovacs  v0.2.10
+ *
+ * 0.2.10: a mop pad that falls off pauses the T30 without any Evt/ErrorCode (2026-11-16 11:03): Home
+ *   showed Paused for an hour. On every pause off the dock the plugin reads WaterInfo; a lower
+ *   mopCount → MopCleaningPadMissing (cleared when the pad is back). Evt 1131 arriving after a
+ *   60-minute pause means the task was ended → UnableToCompleteOperation instead of Stuck.
  *
  * 0.2.9: robot errors raised off the dock (ErrorCode 109 brush tangled, 2026-11-16 08:49) stay until
  *   the robot moves again or reaches the dock: the T30 sends ErrorCode 0 five seconds later while
@@ -795,7 +800,32 @@ class EcovacsDevice {
         this.currentErrorId === RvcOperationalState.ErrorState.MopCleaningPadMissing) {
       this.log.info(`[${this.name}] Mop pad error cleared (pad reattached)`);
       this.clearEvtError(true);
+      return;
     }
+    // Pad lost: the count went down, or (no baseline yet) one of the two pads is missing. The T30
+    // just pauses, without any Evt/ErrorCode (2026-11-16 11:03, app: "portamocio caduto"); Home
+    // showed Paused for an hour. On the dock (charging) a missing pad is not a cleaning fault.
+    const lost = prev >= 0 ? count < prev : count === 1;
+    if (lost && this.chargeState !== OpState.Charging && !this.isPadErrorActive()) {
+      this.log.warn(`[${this.name}] Mop pad lost (${count} attached) → Matter error MopCleaningPadMissing`);
+      this.hasActiveError = true;
+      this.evtErrorActive = true;
+      this.evtErrorClear = 'pad';
+      this.currentErrorId = RvcOperationalState.ErrorState.MopCleaningPadMissing;
+      this.applyState();
+    }
+  }
+
+  private isPadErrorActive(): boolean {
+    return this.evtErrorActive && this.currentErrorId === RvcOperationalState.ErrorState.MopCleaningPadMissing;
+  }
+
+  /** Ask for WaterInfo (mopCount) when the robot pauses: a lost pad pauses it silently. */
+  private lastPauseWaterCheck = 0;
+  private checkPadsOnPause(): void {
+    if (Date.now() - this.lastPauseWaterCheck < 60_000) return;
+    this.lastPauseWaterCheck = Date.now();
+    try { this.vacbot?.run('GetWaterInfo'); } catch { /* best effort */ }
   }
 
   private onEvt(code: number): void {
@@ -820,13 +850,25 @@ class EcovacsDevice {
       this.log.info(`[${this.name}] Evt ${code}${evtName ? ` (${evtName})` : ''} with the robot on the dock: not an error`);
       return;
     }
-    this.log.warn(`[${this.name}] Evt ${code}${evtName ? ` (${evtName})` : ''} → Matter error ${spec.errId}`);
+    let errId = spec.errId;
+    if (code === 1131 && this.cleanState === OpState.Paused) {
+      // 1131 also ends a task paused for 60 minutes (2026-11-09 16:49→17:49, 2026-11-16
+      // 11:03→12:03): the robot gives up where it is. Keep a more specific active error (pad).
+      if (this.isPadErrorActive()) {
+        this.log.info(`[${this.name}] Evt 1131 (task ended after a long pause): keeping the mop pad error`);
+        return;
+      }
+      errId = RvcOperationalState.ErrorState.UnableToCompleteOperation;
+      this.log.warn(`[${this.name}] Evt 1131 after a long pause: task ended → Matter error ${errId}`);
+    } else {
+      this.log.warn(`[${this.name}] Evt ${code}${evtName ? ` (${evtName})` : ''} → Matter error ${errId}`);
+    }
     if (spec.errId === RvcOperationalState.ErrorState.MopCleaningPadMissing)
       this.vacbot?.run('GetWaterInfo'); // refresh mopCount baseline (pad detection)
     this.hasActiveError = true;
     this.evtErrorActive = true;
     this.evtErrorClear = spec.clear;
-    this.currentErrorId = spec.errId;
+    this.currentErrorId = errId;
     // The robot refused to start / cannot proceed: drop the optimistic Running state.
     if (isActiveCleaning(this.cleanState)) this.cleanState = OpState.Stopped;
     this.writeRunMode(RUN.IDLE);
@@ -907,6 +949,7 @@ class EcovacsDevice {
       // Mop washing at the dock (before, during and after a cycle): CleaningMop. The T30
       // repeats 'washing' every second while it lasts; anything else ends it.
       this.setWashing(v === 'washing');
+      if (v === 'pause' && this.chargeState !== OpState.Charging) this.checkPadsOnPause();
       let s = cleanReportToOpState(v);
       // Unknown clean type: the library reports undefined, the raw payload still says 'clean'.
       // The hook sets rawCleanState right before this emit: consume it, so it can never be stale.

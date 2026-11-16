@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.10 — 2026-11-16
+
+- **Mop pad fallen off shown in Apple Home**: when a mop pad (holder) falls off, the T30 just pauses, without any `Evt` or `ErrorCode` (2026-11-16 11:03, app: "mop holder fell off"), and Home showed "Paused" for an hour. On every pause off the dock the plugin now reads `WaterInfo`. A lower `mopCount` (or one pad out of two) raises MopCleaningPadMissing, which clears when the pad is back.
+- **`Evt 1131` after a long pause**: the robot also sends it when it ends a task that was paused for 60 minutes (2026-11-09 and 2026-11-16). It is now shown as "Unable to complete operation" instead of "Stuck", and an active mop pad error is kept.
+
 ## 0.2.9 — 2026-11-16
 
 - **Robot errors stay visible while the robot is stuck**: when the main brush got tangled (`ErrorCode 109`), the T30 sent `ErrorCode 0` five seconds later while still stopped, and Apple Home showed only "Paused" for the next 10 minutes. An error raised off the dock now stays until the robot moves again (cleans or returns) or reaches the dock.
