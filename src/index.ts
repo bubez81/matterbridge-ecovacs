@@ -1,5 +1,12 @@
 /**
- * matterbridge-ecovacs  v0.2.8
+ * matterbridge-ecovacs  v0.2.9
+ *
+ * 0.2.9: robot errors raised off the dock (ErrorCode 109 brush tangled, 2026-11-16 08:49) stay until
+ *   the robot moves again or reaches the dock: the T30 sends ErrorCode 0 five seconds later while
+ *   still stuck, and Home showed only Paused. ErrorCode -2 (ecovacs-deebot threw while parsing) is
+ *   not a robot error. The 'Error' event no longer changes the state: an unrecognized network
+ *   error reset cleanState and Home showed Docked while cleaning. 'NoError' is not logged.
+ *   CleanInfo state 'autoEmpty' → EmptyingDustBin.
  *
  * 0.2.8: Ecovacs device verification (login error 1013, GitHub issue #2). The plugin now asks Ecovacs
  *   to e-mail a code and tells the user to enter it in the new 'verificationCode' setting; on the
@@ -302,6 +309,10 @@ class EcovacsDevice {
   // Without this, CleanReport: undefined (polling, ~200ms after error) resets
   // cleanState → Stopped → applyError sees no error → clears it before Apple Home sees it.
   private hasActiveError = false;
+  // The active ErrorCode error was raised with the robot off the dock (e.g. 109 brush tangled).
+  // The T30 sends ErrorCode 0 a few seconds later while it is still stuck (2026-11-16 08:49):
+  // such an error stays until the robot moves again (cleans, returns) or reaches the dock.
+  private robotErrorAway = false;
 
   // True while the active error comes from an 'Evt' message (auto-clears after a timeout).
   private evtErrorActive = false;
@@ -593,11 +604,15 @@ class EcovacsDevice {
         this.handleAuthFailure();
         return;
       }
-      this.log.warn(`[${this.name}] Vacbot error: ${msg}`);
-      if (!msg || msg.includes('not reachable') || msg.includes('IndexSizeError') ||
-          msg.includes('NoError') || msg.includes('source width is 0') || isCommError(msg)) return;
-      this.cleanState = OpState.Error;
-      this.applyState();
+      // Robot faults arrive as ErrorCode (handled there). 'Error' only carries the text, plus
+      // transport and library failures: log it, never change the state. Until 0.2.8 any text
+      // not recognized as a comm error reset cleanState, and Home showed the robot docked while
+      // it cleaned (2026-11-16 10:59, "Client network socket disconnected before secure TLS…").
+      if (typeof msg !== 'string' || msg.includes('NoError')) return;
+      if (isCommError(msg) || /network socket|TLS|ETIMEDOUT|ECONNRESET|Cannot read properties/.test(msg))
+        this.log.info(`[${this.name}] Vacbot error: ${msg}`);
+      else
+        this.log.warn(`[${this.name}] Vacbot error: ${msg}`);
     });
     this.vacbot.on('disconnect', () => {
       if (this.authRecovering) return; // closed on purpose; handleAuthFailure reconnects
@@ -682,6 +697,9 @@ class EcovacsDevice {
       this.vacbot.handleCleanInfo = (payload: any) => {
         try {
           this.rawCleanState = rawCleanInfoToOpState(payload);
+          // 'autoEmpty': the station empties the dust bin (T30, 2026-11-16 10:49, ~12 s).
+          if (payload?.state === 'autoEmpty') this.setEmptying(true);
+          else if (this.emptying && typeof payload?.state === 'string') this.setEmptying(false);
           // Log each distinct 'clean' shape once: tells which types the library is missing.
           if (payload?.state === 'clean') {
             const cs = payload.cleanState ?? {};
@@ -908,6 +926,13 @@ class EcovacsDevice {
         // Errors are now visible in Apple Home, so they must not outlive the problem.
         this.clearEvtError(false);
         this.hasActiveError = false;
+        this.robotErrorAway = false;
+        this.currentErrorId = RvcOperationalState.ErrorState.NoError;
+      } else if (s === OpState.SeekingCharger && this.robotErrorAway) {
+        // Moving again (sent home): the fault that stopped it is resolved.
+        this.log.info(`[${this.name}] Robot error cleared (returning to the dock)`);
+        this.hasActiveError = false;
+        this.robotErrorAway = false;
         this.currentErrorId = RvcOperationalState.ErrorState.NoError;
       }
       this.applyState();
@@ -920,6 +945,12 @@ class EcovacsDevice {
       const s = chargeStateToOpState(v);
       this.chargeState = s;
       // Back on the dock: a 'dock'-type Evt error (e.g. charging dock not found) is resolved.
+      if (s === OpState.Charging && this.robotErrorAway && !this.evtErrorActive) {
+        this.log.info(`[${this.name}] Robot error cleared (back on the dock)`);
+        this.hasActiveError = false;
+        this.robotErrorAway = false;
+        this.currentErrorId = RvcOperationalState.ErrorState.NoError;
+      }
       if ((s === OpState.Charging || s === OpState.Docked) && this.evtErrorActive && this.evtErrorClear === 'dock') {
         this.log.info(`[${this.name}] Evt error cleared (robot back on dock)`);
         this.clearEvtError(false);
@@ -953,13 +984,22 @@ class EcovacsDevice {
       const code = Number(rawCode);
       // -1 is emitted by ecovacs-deebot for client/connection failures (e.g. MQTT not
       // authorized), not by the robot: never surface it as a robot error in Apple Home.
-      if (code === -1 || Number.isNaN(code)) return;
+      // -2 is emitted by ecovacs-deebot when it throws while parsing a robot message
+      // ("Cannot read properties of undefined"): a library failure, not a robot fault.
+      if (code === -1 || code === -2 || Number.isNaN(code)) return;
       // 500 request timeout, 404 recipient unavailable, 4200 bot offline: the command didn't
       // get through (cloud/robot link), the robot itself has no fault. Leave the state alone;
       // the next successful response emits ErrorCode 0.
       if (COMM_ERROR_CODES.has(code)) return;
       if (code === 0 || code === 100) {
+        if (this.hasActiveError && this.robotErrorAway && !this.evtErrorActive &&
+            this.chargeState !== OpState.Charging &&
+            (this.cleanState === OpState.Paused || this.cleanState === OpState.Error)) {
+          this.log.info(`[${this.name}] ErrorCode: ${code} while the robot is still stopped — keeping the error until it moves again`);
+          return;
+        }
         this.log.info(`[${this.name}] ErrorCode: ${code} (no error)`);
+        this.robotErrorAway = false;
         this.clearEvtError(false);
         this.hasActiveError = false;
         this.currentErrorId = RvcOperationalState.ErrorState.NoError;
@@ -969,16 +1009,12 @@ class EcovacsDevice {
       this.log.warn(`[${this.name}] ErrorCode: ${code}`);
       this.clearEvtError(false);
       this.hasActiveError = true;
+      this.robotErrorAway = this.chargeState !== OpState.Charging;
       this.currentErrorId = ecovacsErrorToMatterError(code);
       this.cleanState = OpState.Error;
       this.applyState();
     });
 
-    this.vacbot.on('Error', (description: string) => {
-      if (typeof description === 'string' && description.includes('Not authorized'))
-        return; // handled (once) by the auth-recovery handler in connect()
-      this.log.warn(`[${this.name}] Robot error: ${description}`);
-    });
 
     // Dock activity (Matter 1.4 states, see applyState).
     this.vacbot.on('AutoEmptyStatus', (st: any) => {

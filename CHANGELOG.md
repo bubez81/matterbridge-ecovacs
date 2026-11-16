@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.9 — 2026-11-16
+
+- **Robot errors stay visible while the robot is stuck**: when the main brush got tangled (`ErrorCode 109`), the T30 sent `ErrorCode 0` five seconds later while still stopped, and Apple Home showed only "Paused" for the next 10 minutes. An error raised off the dock now stays until the robot moves again (cleans or returns) or reaches the dock.
+- **Dust bin emptying shown in Apple Home**: `CleanInfo` state `autoEmpty` (the station emptying the dust bin, ~12 s after the robot returns with `goCharging-ae`) maps to EmptyingDustBin.
+- **No false "Docked" during network drops**: the `Error` event (error text, transport and library failures) no longer changes the state. An unrecognized network error ("Client network socket disconnected before secure TLS connection…") reset the cleaning state, and Home showed the robot on the dock for 30 s while it was cleaning.
+- `ErrorCode -2` (ecovacs-deebot threw while parsing a robot message) is no longer shown as a robot error. It made the robot flash "Error" in Home.
+- Log: "NoError: Robot is operational" is no longer logged as a warning. Network and library failures are logged at info level, once instead of twice.
+
 ## 0.2.8 — 2026-11-16
 
 - **Ecovacs device verification (login error 1013)** ([#2](https://github.com/bubez81/matterbridge-ecovacs/issues/2)): when Ecovacs asks to verify the device, the plugin requests a code by e-mail and explains in the log what to do. Enter the code in the new **Verification code** setting and restart the plugin. The plugin confirms it (`verifyDevice`) and clears the setting. A wrong or expired code triggers a new one. Previously a new user got 5 failed logins in a row, and the only way out was writing `ecovacs-device-auth.json` by hand.
