@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.11 — 2026-11-16
+
+- **Changelog in the npm package**: `CHANGELOG.md` is now published with the package, so the version history can be read on npm too. No code changes.
+
 ## 0.2.10 — 2026-11-16
 
 - **Mop pad fallen off shown in Apple Home**: when a mop pad (holder) falls off, the T30 just pauses, without any `Evt` or `ErrorCode` (2026-11-16 11:03, app: "mop holder fell off"), and Home showed "Paused" for an hour. On every pause off the dock the plugin now reads `WaterInfo`. A lower `mopCount` (or one pad out of two) raises MopCleaningPadMissing, which clears when the pad is back.
