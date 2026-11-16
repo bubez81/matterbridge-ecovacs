@@ -34,6 +34,12 @@
       "minLength": 2,
       "maxLength": 2
     },
+    "verificationCode": {
+      "title": "Verification code",
+      "description": "Only needed if the log says Ecovacs requires device verification (error 1013): enter the code Ecovacs e-mailed to you, then restart the plugin. It is cleared automatically once used.",
+      "type": "string",
+      "default": ""
+    },
     "authDomain": {
       "title": "Auth Domain (optional)",
       "description": "Leave empty for default (ecovacs.com). Use yeedi.com for Yeedi devices.",

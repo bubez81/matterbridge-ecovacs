@@ -1,5 +1,10 @@
 /**
- * matterbridge-ecovacs  v0.2.7
+ * matterbridge-ecovacs  v0.2.8
+ *
+ * 0.2.8: Ecovacs device verification (login error 1013, GitHub issue #2). The plugin now asks Ecovacs
+ *   to e-mail a code and tells the user to enter it in the new 'verificationCode' setting; on the
+ *   next start it confirms the code (verifyDevice) and clears the setting. Previously a new user
+ *   got 5 failed logins and had to write ecovacs-device-auth.json by hand.
  *
  * 0.2.7: Evt 1131 (bumper stuck) is also sent with the robot on the dock when it starts drying
  *   its mops at the end of a cycle (2026-11-09 17:49): Home showed Stuck while the app said
@@ -257,7 +262,22 @@ interface EcovacsConfig extends PlatformConfig {
   email: string; password: string; countryCode: string;
   authDomain?: string; whiteList?: string[];
   pollingInterval?: number; rooms?: RoomConfig[];
+  verificationCode?: string;
 }
+
+/** Ecovacs login code 1013: this device ID must be verified with a code e-mailed to the account. */
+function isDeviceVerificationRequired(e: any): boolean {
+  return e?.name === 'DeviceVerificationRequired' || String(e?.code) === '1013';
+}
+/** Ecovacs verification code 1012: the code is invalid or expired. */
+function isInvalidVerificationCode(e: any): boolean {
+  return e?.name === 'InvalidVerificationCode' || String(e?.code) === '1012';
+}
+/** Thrown after a verification code has been e-mailed: waiting for the user, never retried. */
+class VerificationPending extends Error {
+  constructor(msg: string) { super(msg); this.name = 'VerificationPending'; }
+}
+const VERIFICATION_RESEND_MS = 15 * 60_000;
 
 // ── EcovacsDevice ─────────────────────────────────────────────────────────────
 
@@ -1239,9 +1259,51 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
       }, delay);
     };
 
+    // Device verification (Ecovacs login code 1013). Ecovacs e-mails a code to the account; the
+    // user enters it in the plugin config (verificationCode) and restarts. Once verified, this
+    // device ID logs in with email/password as usual (the ID is the stable machine ID).
+    let lastCodeRequest = 0;
+    const clearVerificationCode = (): void => {
+      if (!cfg.verificationCode) return;
+      cfg.verificationCode = '';
+      try { this.saveConfig({ ...this.config, verificationCode: '' } as unknown as PlatformConfig); }
+      catch (e) { this.log.warn(`Could not clear the verification code from the config: ${String(e)}`); }
+    };
+    const handleVerification = async (): Promise<void> => {
+      const code = cfg.verificationCode?.trim();
+      if (code) {
+        this.log.info(`Ecovacs device verification: confirming the code for ${cfg.email}`);
+        try {
+          await api.verifyDevice(code);
+          clearVerificationCode();
+          this.log.notice('Ecovacs device verification completed: this Matterbridge is now a verified device');
+          this.wssSendSnackbarMessage?.('✅ Ecovacs: device verified', 8000);
+          return;
+        } catch (e) {
+          clearVerificationCode();
+          if (!isInvalidVerificationCode(e)) throw e;
+          this.log.error('Ecovacs device verification: the code is invalid or expired — requesting a new one');
+        }
+      }
+      if (Date.now() - lastCodeRequest >= VERIFICATION_RESEND_MS) {
+        await api.requestDeviceVerificationCode();
+        lastCodeRequest = Date.now();
+      }
+      const msg = `Ecovacs requires device verification (error 1013). A code has been e-mailed to ${cfg.email}: ` +
+        `enter it in the plugin settings ("Verification code") and restart the plugin. The code expires after a few minutes.`;
+      this.log.error(msg);
+      this.wssSendSnackbarMessage?.('Ecovacs: enter the code e-mailed to you in the plugin settings, then restart', 0);
+      throw new VerificationPending(msg);
+    };
+
     const authenticate = async (): Promise<void> => {
       if (!deviceAuth) {
-        await api.connect(cfg.email, EcoVacsAPI.md5(cfg.password));
+        try {
+          await api.connect(cfg.email, EcoVacsAPI.md5(cfg.password));
+        } catch (e) {
+          if (!isDeviceVerificationRequired(e)) throw e;
+          await handleVerification();
+        }
         return;
       }
       api.uid = deviceAuth.uid;
@@ -1270,6 +1332,7 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
           break;
         } catch (err) {
           lastErr = err;
+          if (err instanceof VerificationPending) break; // waiting for the e-mailed code: no retries
           const delay = attempt * 10_000;
           this.log.warn(`Auth failed (attempt ${attempt}/5): ${String(err)} — retrying in ${delay / 1000}s`);
           await new Promise(r => setTimeout(r, delay));

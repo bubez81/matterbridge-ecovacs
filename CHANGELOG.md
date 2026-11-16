@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.8 — 2026-11-16
+
+- **Ecovacs device verification (login error 1013)** ([#2](https://github.com/bubez81/matterbridge-ecovacs/issues/2)): when Ecovacs asks to verify the device, the plugin requests a code by e-mail and explains in the log what to do. Enter the code in the new **Verification code** setting and restart the plugin. The plugin confirms it (`verifyDevice`) and clears the setting. A wrong or expired code triggers a new one. Previously a new user got 5 failed logins in a row, and the only way out was writing `ecovacs-device-auth.json` by hand.
+- No retries while waiting for the code. A new code is requested at most every 15 minutes.
+
 ## 0.2.7 — 2026-11-09
 
 - **No false "Stuck" at the end of a cycle**: the T30 sends `Evt 1131` (bumper stuck) also when, back on the dock, it starts drying its mops (2026-11-09 17:49, app: "asciugatura dei panni"), and Home kept showing the error. 1131 is now an error only when the robot is off the dock; on the dock it is logged.

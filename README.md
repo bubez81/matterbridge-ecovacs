@@ -75,6 +75,7 @@ Or set it in the Matterbridge UI under **Settings → Bridge mode**.
 | `email` | yes | Ecovacs account email | `you@example.com` |
 | `password` | yes | Ecovacs account password | `yourpassword` |
 | `countryCode` | yes | Two-letter country code | `IT` `DE` `US` `FR` |
+| `verificationCode` | no | Only when the log asks for it (Ecovacs error 1013): the code e-mailed by Ecovacs. Cleared automatically once used | `123456` |
 | `authDomain` | no | Leave empty for Ecovacs; use `yeedi.com` for Yeedi devices | |
 | `whiteList` | no | Only expose these device nicknames or DIDs | `["T30 Omni"]` |
 | `rooms` | no | Auto-populated on first run — edit names and enable/disable rooms | |
@@ -154,7 +155,8 @@ Developed and tested on **Deebot T30 Omni**. Should work with all 950-type proto
 ## Technical notes
 
 - Authentication tokens are cached in `~/.matterbridge/ecovacs-token.json` (mode 600) to avoid rate limiting. The token is renewed automatically about 1 h before it expires (validity ~7 days) without dropping the connection; if the MQTT broker ever rejects it ("Not authorized"), the plugin re-authenticates once, refreshes the cache and reconnects.
-- If Ecovacs requires device verification (error 1013), a verified device identity can be stored in `~/.matterbridge/ecovacs-device-auth.json` (`email`, `deviceId`, `uid`, `accessToken`); the plugin then logs in with that identity instead of email/password.
+- **Device verification (error 1013).** On the first login, Ecovacs may ask to verify this device. The plugin then asks Ecovacs to e-mail a code to your account, and logs: *"Ecovacs requires device verification (error 1013). A code has been e-mailed to …"*. Enter the code in the plugin settings (**Verification code**) and restart the plugin. The code expires after a few minutes. On the next start the plugin confirms the code and clears the setting. This Matterbridge is then a verified device, and later logins use your email and password as usual. If the code is wrong or expired, the plugin requests a new one and says so in the log.
+- As an alternative, an already verified identity can be stored in `~/.matterbridge/ecovacs-device-auth.json` (`email`, `deviceId`, `uid`, `accessToken`); the plugin then logs in with that identity instead of email/password.
 - Robot errors are shown in Apple Home: while an error is active the vacuum reports the Matter `Error` state together with the error type.
 - Some warnings are sent by the robot as `Evt` messages, which `ecovacs-deebot` does not decode. Known codes are mapped: `1128` = mop pad missing → "Insert the mop pad" (clears as soon as the pad is reattached, detected through `WaterInfo.mopCount`); `1131` = bumper stuck → Stuck (clears on the next start); `1026` = charging dock not found (clears when the robot is back on the dock). Errors stay visible until resolved; a real cleaning start or `ErrorCode 0` also clears them. Other codes known to ecovacs-deebot are logged by name. Unknown codes are logged as `Unhandled Evt code: N` — please open an issue with the code and what the Ecovacs app showed.
 - Built on `ecovacs-deebot` 1.0 (MQTT/JSON).
