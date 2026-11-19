@@ -275,7 +275,46 @@ interface EcovacsConfig extends PlatformConfig {
   authDomain?: string; whiteList?: string[];
   pollingInterval?: number; rooms?: RoomConfig[];
   verificationCode?: string;
+  /** ID of the robot map the rooms were read from; written by the plugin. */
+  mapId?: string;
 }
+
+const normName = (n?: string) => (n ?? '').trim().toLowerCase();
+
+/**
+ * Compare the configured rooms with the rooms on the robot's current map.
+ * Returns the new room list when the map changed (new map ID, different room IDs, or a
+ * room name that moved to another ID), or null when the configured rooms are still valid.
+ * Rooms are matched by name, so custom names and enabled flags survive a re-mapping
+ * when the rooms keep their names in the Ecovacs app.
+ */
+export function reconcileRooms(config: RoomConfig[], storedMapId: string | undefined, mapId: string,
+                               found: Map<string, string>): RoomConfig[] | null {
+  const foundIds = [...found.keys()];
+  const cfgIds = config.map(r => r.id);
+  let changed = !!storedMapId && storedMapId !== mapId;
+  if (!changed) changed = cfgIds.length !== foundIds.length || cfgIds.some(id => !found.has(id));
+  if (!changed) {
+    // Same IDs, but a robot room name now sits on a different ID than in the config.
+    const robotIdByName = new Map([...found].map(([id, n]) => [normName(n), id]));
+    changed = config.some(r => {
+      const other = robotIdByName.get(normName(r.name));
+      return other !== undefined && other !== r.id;
+    });
+  }
+  if (!changed) return null;
+  const byName = new Map(config.map(r => [normName(r.name), r]));
+  return foundIds
+    .sort((a, b) => (parseInt(a, 10) || 0) - (parseInt(b, 10) || 0))
+    .map(id => {
+      const robotName = found.get(id)!;
+      const old = byName.get(normName(robotName));
+      return old ? { id, name: old.name, enabled: old.enabled !== false } : { id, name: robotName, enabled: true };
+    });
+}
+
+/** Re-read the robot map this often, so a re-mapped house is picked up without a restart. */
+const MAP_CHECK_MS = 6 * 60 * 60 * 1000;
 
 /** Ecovacs login code 1013: this device ID must be verified with a code e-mailed to the account. */
 function isDeviceVerificationRequired(e: any): boolean {
@@ -392,16 +431,24 @@ class EcovacsDevice {
   private cleanMode: number = CLEAN.VACUUM;
 
   onRoomsDiscovered?: (rooms: RoomConfig[]) => void;
+  /** Called when the robot map changed (rooms !== null) or to store the map ID the first time. */
+  onRoomsChanged?: (rooms: RoomConfig[] | null, mapId: string) => void;
+  // Map check: GetMaps → GetSpotAreas → GetSpotAreaInfo for every room
+  private discovering = false;
+  private discoverMapId = '';
+  private discoverTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastMapCheck = 0;
 
   constructor(
     private readonly api: any,
     private readonly vacuum: EcovacsVacuumInfo,
     private readonly pollSec: number,
     private readonly log: AnsiLogger,
-    private readonly roomsConfig: RoomConfig[] = [],
+    private roomsConfig: RoomConfig[] = [],
+    private storedMapId?: string,
   ) {
     if (roomsConfig.length > 0) {
-      // Pre-load rooms from config: skip GetMaps entirely and pre-set lastPushedAreas
+      // Pre-load rooms from config and pre-set lastPushedAreas
       // so the first updateServiceAreas call sees no delta and makes no write.
       // This prevents the [] → [N rooms] transition that triggers Apple Home "Aggiornamento".
       this.roomsLoaded = true;
@@ -597,7 +644,7 @@ class EcovacsDevice {
         this.vacbot?.run('GetChargeState');
         this.vacbot?.run('GetCleanState_V2');
         this.vacbot?.run('GetWaterInfo'); // baseline for mopCount (attached mop pads)
-        if (!this.roomsLoaded) this.vacbot?.run('GetMaps');
+        this.checkMap();
         this.startPolling();
       }, 3000);
     });
@@ -634,6 +681,7 @@ class EcovacsDevice {
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     if (this.opStateTimer)   { clearTimeout(this.opStateTimer);   this.opStateTimer = null; }
     if (this.areasTimer)     { clearTimeout(this.areasTimer);      this.areasTimer = null; }
+    if (this.discoverTimer)  { clearTimeout(this.discoverTimer);   this.discoverTimer = null; }
     if (this.washTimer)      { clearTimeout(this.washTimer);       this.washTimer = null; }
     if (this.emptyTimer)     { clearTimeout(this.emptyTimer);      this.emptyTimer = null; }
     await this.disposeVacbot();
@@ -1073,49 +1121,92 @@ class EcovacsDevice {
       this.log.debug(`[${this.name}] StatusInfo: ${JSON.stringify(v)}`);
     });
 
-    // Room / map discovery
-    this.vacbot.on('CurrentMapMID', (mapID: string) => {
-      if (this.roomsLoaded) return;
+    // Room / map discovery (see checkMap)
+    this.vacbot.on('Maps', (maps: any) => {
+      if (!this.discovering || this.discoverMapId) return;
+      const list: any[] = Array.isArray(maps) ? maps : (maps?.mapData ?? []);
+      const cur = list.find(m => m?.mapIsCurrentMap === true) ?? list[0];
+      const mapID = cur?.mapID ?? cur?.mapId;
+      if (!mapID) return;
+      this.discoverMapId = String(mapID);
       this.vacbot.run('GetSpotAreas', mapID);
     });
 
-    this.vacbot.on('Maps', (maps: any) => {
-      if (this.roomsLoaded) return;
-      const list = Array.isArray(maps) ? maps : (maps?.mapData ?? []);
-      const first = list[0];
-      if (first) {
-        const mapID = first.mapID ?? first.mapId;
-        if (mapID) this.vacbot.run('GetSpotAreas', mapID);
-      }
-    });
-
     this.vacbot.on('MapSpotAreas', (areas: any) => {
-      if (this.roomsLoaded) return;
-      const mapID = areas?.mapID ?? areas?.mapId;
+      if (!this.discovering) return;
+      const mapID = String(areas?.mapID ?? areas?.mapId ?? '');
+      if (!mapID || mapID !== this.discoverMapId) return;
       const list: any[] = Array.isArray(areas) ? areas : (areas?.mapSpotAreas ?? []);
-      if (mapID && list.length > 0) {
-        this.roomsExpected = list.length;
-        for (const area of list) {
-          const id = area?.mapSpotAreaID ?? area?.spotAreaID ?? area?.id;
-          if (id !== undefined) this.vacbot.run('GetSpotAreaInfo', mapID, id);
-        }
+      if (list.length === 0) return;
+      this.rooms.clear();
+      this.roomsExpected = list.length;
+      for (const area of list) {
+        const id = area?.mapSpotAreaID ?? area?.spotAreaID ?? area?.id;
+        if (id !== undefined) this.vacbot.run('GetSpotAreaInfo', mapID, id);
       }
     });
 
     this.vacbot.on('MapSpotAreaInfo', (info: any) => {
+      if (!this.discovering || this.roomsExpected === 0) return;
+      if (String(info?.mapID ?? info?.mapId ?? '') !== this.discoverMapId) return;
       const id = String(info?.mapSpotAreaID ?? info?.spotAreaID ?? info?.id ?? '');
       const name = info?.customName || info?.mapSpotAreaName || info?.name || `Area ${id}`;
-      if (id) {
-        this.rooms.set(id, name);
-        this.updateServiceAreas();
-      }
+      if (!id) return;
+      this.rooms.set(id, name);
+      if (this.rooms.size >= this.roomsExpected) this.finishMapCheck();
     });
+  }
+
+  /** Read the robot's current map and its rooms; finishMapCheck() compares them with the config. */
+  private checkMap(): void {
+    if (this.discovering || !this.vacbot) return;
+    this.lastMapCheck = Date.now();
+    this.discovering = true;
+    this.discoverMapId = '';
+    this.roomsExpected = 0;
+    this.discoverTimer = setTimeout(() => {
+      this.discoverTimer = null;
+      if (!this.discovering) return;
+      this.discovering = false;
+      this.log.info(`[${this.name}] Map check: no complete room list from the robot (${this.rooms.size}/${this.roomsExpected}), keeping the current rooms`);
+    }, 60_000);
+    this.vacbot.run('GetMaps');
+  }
+
+  private finishMapCheck(): void {
+    this.discovering = false;
+    if (this.discoverTimer) { clearTimeout(this.discoverTimer); this.discoverTimer = null; }
+    const mapId = this.discoverMapId;
+    const found = new Map(this.rooms);
+    this.log.info(`[${this.name}] Map ${mapId}: ${[...found].map(([id, n]) => `${id}=${n}`).join(', ')}`);
+
+    if (this.roomsConfig.length === 0) {
+      this.updateServiceAreas();
+      return;
+    }
+    const updated = reconcileRooms(this.roomsConfig, this.storedMapId, mapId, found);
+    if (!updated) {
+      if (this.storedMapId !== mapId) {
+        this.storedMapId = mapId;
+        this.onRoomsChanged?.(null, mapId);
+      }
+      return;
+    }
+    this.log.warn(`[${this.name}] The robot map changed (map ${this.storedMapId ?? '?'} → ${mapId}): rooms updated to ` +
+      updated.map(r => `${r.id}=${r.name}${r.enabled === false ? ' (hidden)' : ''}`).join(', '));
+    this.roomsConfig = updated;
+    this.storedMapId = mapId;
+    this.selectedAreaIds = [];
+    this.onRoomsChanged?.(updated, mapId);
+    void this.endpoint?.updateAttribute('ServiceArea', 'selectedAreas', [], this.log);
+    void this.endpoint?.updateAttribute('ServiceArea', 'currentArea', null, this.log);
+    this.updateServiceAreas();
   }
 
   private updateServiceAreas(): void {
     if (!this.endpoint || this.rooms.size === 0) return;
     const firstDiscovery = !this.roomsLoaded;
-    if (this.roomsExpected === 0 || this.rooms.size >= this.roomsExpected) this.roomsLoaded = true;
+    this.roomsLoaded = true;
 
     if (firstDiscovery && this.roomsLoaded && this.roomsConfig.length === 0 && this.onRoomsDiscovered) {
       const disc = Array.from(this.rooms.entries()).map(([id, name]) => ({ id, name, enabled: true }));
@@ -1244,6 +1335,7 @@ class EcovacsDevice {
       this.vacbot?.run('GetBatteryState');
       this.vacbot?.run('GetChargeState');
       this.vacbot?.run('GetCleanState_V2');
+      if (Date.now() - this.lastMapCheck > MAP_CHECK_MS) this.checkMap();
     }, this.pollSec * 1000);
   }
 
@@ -1454,7 +1546,7 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
     this.log.info(`Found ${filtered.length} Ecovacs device(s)`);
     scheduleRefresh();
     for (const vac of filtered) {
-      await this.registerVacuum(api, vac, cfg.pollingInterval ?? 15, cfg.rooms ?? []);
+      await this.registerVacuum(api, vac, cfg.pollingInterval ?? 15, cfg.rooms ?? [], cfg.mapId);
     }
   }
 
@@ -1469,12 +1561,20 @@ class EcovacsPlatform extends MatterbridgeDynamicPlatform {
 
   async onConfigure(): Promise<void> { this.log.info('onConfigure'); }
 
-  private async registerVacuum(api: any, vac: EcovacsVacuumInfo, pollSec: number, roomsConfig: RoomConfig[]): Promise<void> {
+  private async registerVacuum(api: any, vac: EcovacsVacuumInfo, pollSec: number, roomsConfig: RoomConfig[], mapId?: string): Promise<void> {
     const name = vac.nick || vac.deviceName || vac.did;
     this.log.info(`Registering: "${name}" (${vac.did})`);
 
-    const device = new EcovacsDevice(api, vac, pollSec, this.log, roomsConfig);
+    const device = new EcovacsDevice(api, vac, pollSec, this.log, roomsConfig, mapId);
     device.reauth = () => this.reauth();
+    device.onRoomsChanged = (rooms: RoomConfig[] | null, newMapId: string) => {
+      const cfg = this.config as EcovacsConfig;
+      if (rooms) cfg.rooms = rooms;
+      cfg.mapId = newMapId;
+      try { this.saveConfig(cfg as unknown as PlatformConfig); }
+      catch (e) { this.log.warn(`Could not save the updated rooms: ${(e as Error).message}`); }
+      if (rooms) this.wssSendSnackbarMessage(`🗺 ${name}: mappa cambiata, ${rooms.length} stanze aggiornate`, 10000);
+    };
 
     if (roomsConfig.length === 0) {
       device.onRoomsDiscovered = (disc: RoomConfig[]) => {

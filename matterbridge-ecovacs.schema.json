@@ -71,7 +71,7 @@
     },
     "rooms": {
       "title": "Room Configuration",
-      "description": "Customize which rooms are visible in Apple Home and their display names. Rooms not listed here will be shown with their names from the Ecovacs app.",
+      "description": "Rooms shown in Apple Home, with their display names. Filled in automatically from the robot map. If you re-map the house in the Ecovacs app, the plugin notices the new map and rebuilds this list (rooms keep your name and Enabled setting when their name in the Ecovacs app is the same).",
       "type": "array",
       "items": {
         "type": "object",
@@ -99,6 +99,13 @@
         }
       },
       "default": []
+    },
+    "mapId": {
+      "title": "Map ID",
+      "description": "ID of the robot map the rooms were read from. Set by the plugin; leave it alone.",
+      "type": "string",
+      "default": "",
+      "readOnly": true
     }
   }
 }

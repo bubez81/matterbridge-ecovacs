@@ -96,6 +96,8 @@ Or set it in the Matterbridge UI under **Settings → Bridge mode**.
 
 On first startup the plugin auto-discovers all rooms from the robot's map and saves them to the plugin config. You can then rename rooms and enable/disable them via the Matterbridge UI. Changes take effect after restarting Matterbridge.
 
+If you re-map the house (or the map is lost and rebuilt), the room IDs change. The plugin reads the robot map at every start and every 6 hours; when the map changed it rebuilds the room list, saves it to the config and updates Apple Home by itself. A room keeps your custom name and Enabled setting if it has the same name in the Ecovacs app; new rooms get their Ecovacs name. You may need to assign the rooms in the Home app again.
+
 ```json
 "rooms": [
   { "id": "0", "name": "Living Room", "enabled": true },
@@ -147,7 +149,7 @@ Developed and tested on **Deebot T30 Omni**. Should work with all 950-type proto
 - For Yeedi devices, set `authDomain` to `yeedi.com`
 
 **Rooms do not appear or are wrong**
-- Delete the `rooms` array from the plugin config and restart — rooms will be re-discovered automatically
+- The plugin rebuilds the list by itself when the robot map changes (at start and every 6 hours). To force it, delete the `rooms` array from the plugin config and restart
 
 **State does not update**
 - The plugin polls every 5 seconds; state changes from the Ecovacs app may take up to 10 seconds to appear in Apple Home

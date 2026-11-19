@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.12 — 2026-11-19
+
+- **Rooms follow a new robot map**: after a re-mapping (for example when the Ecovacs map gets corrupted and the house is mapped again) the room IDs change, but the plugin kept the old IDs from its config, so room cleaning in Apple Home pointed at rooms that no longer existed. The plugin now reads the robot's current map at every start and every 6 hours. When the map ID or the room IDs changed, it rebuilds the room list, saves it (with the new `mapId`) and updates the rooms in Apple Home without a restart. Rooms that keep their name in the Ecovacs app keep your custom name and Enabled setting.
+- Includes 0.2.11 (`CHANGELOG.md` in the npm package), which was not published on its own.
+
 ## 0.2.11 — 2026-11-16
 
 - **Changelog in the npm package**: `CHANGELOG.md` is now published with the package, so the version history can be read on npm too. No code changes.
