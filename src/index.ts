@@ -790,7 +790,7 @@ class EcovacsDevice {
       const disp = this.vacbot?.ecovacs?.dispatcher;
       if (typeof disp?.handleMessagePayload !== 'function') return;
       const orig = disp.handleMessagePayload.bind(disp);
-      const WATCH = /Station|AutoEmpty|WorkState|Relocation|MapState|BuildMap|Mapping|Water|AirDr|DryingDuration|WashInfo/i;
+      const WATCH = /Station|AutoEmpty|WorkState|Relocation|MapState|BuildMap|Mapping|CachedMapInfo|MapSet\b|Water|AirDr|DryingDuration|WashInfo/i;
       disp.handleMessagePayload = (command: string, payload: any) => {
         try {
           const name = String(command).replace(/^_+|_+$/g, '');
@@ -1121,15 +1121,17 @@ class EcovacsDevice {
       this.log.debug(`[${this.name}] StatusInfo: ${JSON.stringify(v)}`);
     });
 
-    // Room / map discovery (see checkMap)
-    this.vacbot.on('Maps', (maps: any) => {
-      if (!this.discovering || this.discoverMapId) return;
-      const list: any[] = Array.isArray(maps) ? maps : (maps?.mapData ?? []);
-      const cur = list.find(m => m?.mapIsCurrentMap === true) ?? list[0];
-      const mapID = cur?.mapID ?? cur?.mapId;
-      if (!mapID) return;
+    // Room / map discovery (see checkMap). GetMaps answers with CurrentMapMID, then Maps ({ maps: [...] }).
+    const useMap = (mapID: unknown) => {
+      if (!this.discovering || this.discoverMapId || !mapID || String(mapID) === '0') return;
       this.discoverMapId = String(mapID);
-      this.vacbot.run('GetSpotAreas', mapID);
+      this.vacbot.run('GetSpotAreas', this.discoverMapId);
+    };
+    this.vacbot.on('CurrentMapMID', (mapID: unknown) => useMap(mapID));
+    this.vacbot.on('Maps', (maps: any) => {
+      const list: any[] = Array.isArray(maps) ? maps : (maps?.maps ?? maps?.mapData ?? []);
+      const cur = list.find(m => m?.mapIsCurrentMap === true) ?? list[0];
+      useMap(cur?.mapID ?? cur?.mapId);
     });
 
     this.vacbot.on('MapSpotAreas', (areas: any) => {
@@ -1168,7 +1170,7 @@ class EcovacsDevice {
       this.discoverTimer = null;
       if (!this.discovering) return;
       this.discovering = false;
-      this.log.info(`[${this.name}] Map check: no complete room list from the robot (${this.rooms.size}/${this.roomsExpected}), keeping the current rooms`);
+      this.log.info(`[${this.name}] Map check: no complete room list from the robot (map ${this.discoverMapId || '?'}, ${this.rooms.size}/${this.roomsExpected} rooms), keeping the current rooms`);
     }, 60_000);
     this.vacbot.run('GetMaps');
   }

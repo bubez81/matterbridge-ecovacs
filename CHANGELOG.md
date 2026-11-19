@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.13 — 2026-11-19
+
+- **Fix for the 0.2.12 map check**: the plugin never got the robot's map ID, because it read the map list from the wrong field of the `Maps` event (`mapData` instead of `maps`), so the check gave up after a minute and kept the old rooms. It now takes the map ID from `CurrentMapMID`, which the robot sends first, or from `Maps.maps`. The raw `CachedMapInfo` and `MapSet` messages are logged once to help with other models.
+
 ## 0.2.12 — 2026-11-19
 
 - **Rooms follow a new robot map**: after a re-mapping (for example when the Ecovacs map gets corrupted and the house is mapped again) the room IDs change, but the plugin kept the old IDs from its config, so room cleaning in Apple Home pointed at rooms that no longer existed. The plugin now reads the robot's current map at every start and every 6 hours. When the map ID or the room IDs changed, it rebuilds the room list, saves it (with the new `mapId`) and updates the rooms in Apple Home without a restart. Rooms that keep their name in the Ecovacs app keep your custom name and Enabled setting.
